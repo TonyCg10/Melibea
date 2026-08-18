@@ -875,14 +875,53 @@ reporting it would tell `celestina msg` a minimize had succeeded before Niri had
 Only an end-to-end run could have found this: every unit test passed before and after, since
 the defect lived in the seam between two components that are individually correct.
 
+### The selector's own restore route, and the defect it exposed
+
+The harness now drives the selector for real: `celestina msg bubbles-toggle` opens it and
+`wtype -k Return` presses the key, against the nested compositor. Run
+`run-20260818-190551`, **28 of 28 checks**, no panic or warning in either log.
+
+Getting there exposed a second product defect. `bubbles-toggle` went through
+`toggleOverlay`, which calls `controller->toggle()` rather than `toggleFrom(panel, ...)`,
+so `m_openerPanel` was null and the anchor block never ran. Opening the selector from a
+keybind or the CLI therefore gave it **no anchor at all**, and its restores would have
+fallen back to ordinary Niri motion. Only opening it by clicking the panel worked.
+
+The fix separates two things that were wrongly tied together: a bubble anchor depends only
+on which monitor the surface belongs to, never on where a pointer was. So the anchor block
+left the opener-geometry guard, and `OverlayController::toggleWithBubbleAnchor` takes the
+rectangle directly. The narrow `BubbleAnchorSource` interface stayed narrow — the shell
+service still asks for one rectangle and one preference, not for a panel manager.
+
+What the shell wrote across a full minimize/restore cycle:
+
+```text
+C> {"version":2,"request":{"type":"minimize","window_id":null,"transition":{...}}}
+C> {"version":2,"request":{"type":"restore","window_id":2,"transition":{"type":"anchored",
+   "anchor":{"output":"winit","x":580.0,"y":5.0,"width":22.0,"height":22.0}}}}
+```
+
+The selector names an exact window, because it is acting on a bubble it is already
+showing; only a minimize asks Niri to resolve focus.
+
+### Anchor stability, and what the wire log does not mean
+
+Those recorded anchors drift between actions — x moved 652, 580, 546 across one run. That
+is **not** the group moving its own anchor, and the M7 exit criterion is met:
+`tst_bubbleanchorslot.qml` drives bubble counts 0, 1, 3 and back to 1 against a trailing
+cluster and asserts the slot's position is identical throughout, plus that it exists at
+full size before the first bubble.
+
+The drift comes from the rest of the panel changing width around it — the clock and the
+workspace strip move as windows map and unmap. That is exactly why the anchor is queried
+at action time and never stored: whatever else moved, the next action describes where the
+slot is now. A stored rectangle would have been wrong by the second action.
+
 ### What M7 still needs
 
 - QML tests for the anchor slot, and a `VAL-BUBBLE-2` matrix covering multi-output,
   reduced motion, and assistive technology.
 - BUBBLE-2 plan, roadmap, and evidence text.
-- Restoring through the selector. The harness drives a restore through Melibea directly and
-  checks the shell follows it, but the selector's own route — the anchor snapshot it
-  receives when it opens — needs synthesised input the harness does not produce.
 - Tiled and floating windows and transient families, which the current matrix does not
   separate.
 - Whether the travel is actually *seen*. Every check here is state and wire form; no test
@@ -901,10 +940,10 @@ is a visible layout decision and should be looked at on real hardware.
 copy:   /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-nest
 build:  /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-build
 patch:  /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-m7.patch
-bytes:  70197
-lines:  1637
-sha256: b00323a8ac58479079200659cb2b4b01a75d50809887f9d3917e9a1aa5c2453d
-scope:  21 files, 1068 insertions, 42 deletions
+bytes:  80173
+lines:  1877
+sha256: 27b36a4de3cddb3cb27e507f90b04e92c8f59284476147bcf089f488b14ec55c
+scope:  23 files, 1251 insertions, 43 deletions
 ```
 
 This lives on persistent storage rather than `/tmp`, which is what destroyed the
