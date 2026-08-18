@@ -917,13 +917,51 @@ workspace strip move as windows map and unmap. That is exactly why the anchor is
 at action time and never stored: whatever else moved, the next action describes where the
 slot is now. A stored rectangle would have been wrong by the second action.
 
+### Tiled, floating and transient families
+
+Run `run-20260818-191606`, **41 of 41**, reproduced twice with an identical result.
+
+Floating and tiled are separate code paths in Niri, so each is now minimized and restored
+with an anchor and then checked for what it came back *as*: the floating window is still
+floating, and the tiled one is still tiled. A window quietly changing layer by having been
+minimized would otherwise pass every earlier check.
+
+Transient families needed a real client — Kitty cannot make a transient toplevel — so
+`transient_family.py` maps a GTK parent with a transient child. The minimize is driven from
+the **child** on purpose, because Niri roots a family at its highest visible ancestor and
+the interesting claim is that the root is what gets published. The checks are that the whole
+family leaves together, that it becomes **one** bubble rather than one per surface, that
+restoring that one entry brings every member back, and that minimized state is then empty.
+
+### Process hygiene: a leak this work introduced and then closed
+
+Three nested Niri instances were found still running from earlier runs, plus seven
+`dbus-daemon` session buses. They were identified by the private `XDG_RUNTIME_DIR` in each
+process's own environment — never by name — and ended. The author's real session was
+verified untouched at every step.
+
+Two causes, both now fixed:
+
+- `dbus-run-session -- niri` does its real work in a **child**. Signalling only the spawned
+  process left the compositor running. Every spawn now leads its own session and the whole
+  process group is signalled.
+- The teardown guard required the harness's own label to appear in the process's command
+  line, which a client like Kitty never carries. It now checks the private runtime directory
+  in the process's environment first, which every nest process inherits and nothing on the
+  host shares.
+
+A final sweep ends anything still holding the run's runtime directory, whatever spawned it.
+There is still no `pkill` and no matching by name. A run now leaves zero processes behind,
+verified after two consecutive runs.
+
+This matters beyond tidiness: those leaked compositors were live during the run that failed
+two Celestina checks, and that run passes cleanly once they are gone.
+
 ### What M7 still needs
 
 - QML tests for the anchor slot, and a `VAL-BUBBLE-2` matrix covering multi-output,
   reduced motion, and assistive technology.
 - BUBBLE-2 plan, roadmap, and evidence text.
-- Tiled and floating windows and transient families, which the current matrix does not
-  separate.
 - Whether the travel is actually *seen*. Every check here is state and wire form; no test
   asserts that anything visually moved.
 - A final adversarial review of the combined delta.
