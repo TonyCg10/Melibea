@@ -718,8 +718,24 @@ sha256: b0fe1d2ef58ffbb8077df9bd649546eef49d627f11397f7f6dea237ff03bdffe
 scope:  5 files, 185 insertions, 7 deletions
 ```
 
-It passes `git apply --check` against the real checkout. It was deliberately
-**not** applied.
+**Applied to the real checkout on 2026-08-18**, at the author's explicit request and as an
+isolated step: source files only, with no build, no service restart, and no Niri restart.
+All 24 files were then verified byte-for-byte identical to the validated copy. Nothing was
+staged, committed, or pushed.
+
+A first attempt applied a 23-file patch that was missing `tst_bubbleanchorslot.qml`, because
+`git diff` does not see an untracked file and that test had been written after the others
+were marked intent-to-add. It was reversed with `git apply -R`, the file was added with
+`git add -N`, and the complete patch was applied. Any future new file needs the same
+`git add -N` before the patch is generated, or it will be silently absent.
+
+To reverse it: `git apply -R` with this exact patch, from the repository root. A pre-apply
+backup of the working tree is at `celestina-pre-apply-backup.patch`, with the file listing
+in `celestina-pre-apply-status.txt`.
+
+The author was editing `siderita/` concurrently during this work. Those edits are unrelated
+and untouched: this patch names no file outside `celestina/` and
+`celestina-rs/crates/celestina-shell-core/`.
 
 ### Celestina M7 delta: rewritten as far as the wire and the adapter
 
@@ -959,6 +975,10 @@ two Celestina checks, and that run passes cleanly once they are gone.
 
 ### What M7 still needs
 
+The real checkout now holds the source, but **nothing has been built or deployed from it**.
+The shell running in the session is still the previous binary.
+
+
 - QML tests for the anchor slot, and a `VAL-BUBBLE-2` matrix covering multi-output,
   reduced motion, and assistive technology.
 - BUBBLE-2 plan, roadmap, and evidence text.
@@ -978,10 +998,10 @@ is a visible layout decision and should be looked at on real hardware.
 copy:   /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-nest
 build:  /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-build
 patch:  /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-m7.patch
-bytes:  80173
-lines:  1877
-sha256: 27b36a4de3cddb3cb27e507f90b04e92c8f59284476147bcf089f488b14ec55c
-scope:  23 files, 1251 insertions, 43 deletions
+bytes:  84014
+lines:  1998
+sha256: 70d7949890be002b30871b4d65cbea31b71b82e2db057ff2d995a063573ee4f8
+scope:  24 files, 1366 insertions, 43 deletions
 ```
 
 This lives on persistent storage rather than `/tmp`, which is what destroyed the
