@@ -721,22 +721,98 @@ scope:  5 files, 185 insertions, 7 deletions
 It passes `git apply --check` against the real checkout. It was deliberately
 **not** applied.
 
-### What M7 still needs
+### Celestina M7 delta: rewritten as far as the wire and the adapter
 
-The Celestina M7 delta itself was lost with `/tmp` and has **not** been
-rewritten. BUBBLE-1 has no notion of a transition, and
-`ClientEnvelope::action` still returns `None` for `Operation::Minimize`, so the
-shell cannot originate a minimize at all. Rebuilding it means:
+The delta lost with `/tmp` is being rewritten in the same isolated copy. Two of
+its four parts are complete and tested; the two that remain are shell plumbing.
 
-- protocol v2 in `celestina-shell-core::melibea`: version negotiation,
-  `WindowTransition`/`BubbleAnchor`, and a minimize request;
-- the `minimize` verb in the provider adapter, with the anchor queried at
-  action time and reduced motion forwarded as `disabled`;
-- the permanent 22x22 non-painting bubble slot, present before the first bubble
-  and stable at the front edge as the group grows;
-- `celestina msg minimize`, per-operation provider option keys, and shell-side
-  gating on `providers["melibea"]["available"]` being boolean `true`;
-- BUBBLE-2 plan, roadmap, and `VAL-BUBBLE-2` coverage.
+**Done — protocol v2 in `celestina-shell-core::melibea`.** `PROTOCOL_VERSION_V2`
+and `SUPPORTED_PROTOCOL_VERSIONS` were added, `decode_message` now reads a v1 or
+v2 reply, and `WindowTransition`/`BubbleAnchor` carry an action-scoped hint.
+`Request` gained a `Minimize` variant and an optional `transition` on minimize
+and restore, skipped entirely when absent so an explicit `null` can never be
+sent. `Eq` was dropped from the request types because an anchor carries `f64`.
+
+The version is chosen by the request, not by the shell:
+`action_with_transition` stays on v1 whenever there is no hint, so a Melibea
+that speaks only v1 still serves every ordinary action. Close refuses a hint
+rather than sending one Melibea would ignore, because it has no destination to
+travel to. One pre-existing test asserted that version 2 was incompatible; that
+assertion encoded the v1-only assumption this work repeals, so it now names a
+genuinely unsupported version and a new test owns the v1/v2 boundary.
+
+**Done — the provider adapter.** It serves `minimize` as well as `restore` and
+`close`, reads the hint from each action's own options rather than remembering
+one, and refuses an unknown kind, a missing output, a missing coordinate, or an
+unusable rectangle locally instead of sending it on.
+
+Confirmation is directional: minimize settles when the window becomes **present**
+in the projection, restore and close when it becomes **absent**. `Settles`
+carries that per request, so neither ever settles on the action's own optimistic
+reply.
+
+The option keys are flat, matching the existing `window_id` idiom:
+`transition` is `"anchored"` or `"disabled"`; an anchored hint adds
+`anchor_output`, `anchor_x`, `anchor_y`, `anchor_width`, `anchor_height`.
+
+**Started — the permanent anchor slot.** `celestina/qml/BubbleAnchorSlot.qml` is
+a non-painting, input-inert, accessibility-ignored 22x22 item that converts its
+position to output-local logical coordinates by subtracting the screen origin
+from `mapToGlobal`, and builds the transition options at action time.
+Reduced motion wins over the anchor: it sends `disabled` rather than travel to a
+different place.
+
+It is placed in the panel's bubble cluster, after the group, which is the edge
+the group grows away from. `PanelCluster` gained `showsGlass`, defaulting to
+`hasContent`, so the cluster can reserve space for something invisible without a
+glass pill sitting under nothing; every existing caller is unchanged.
+
+Evidence: 130 Rust tests in `celestina` and 346 in `celestina-shell-core` pass,
+strict Clippy is clean for both, and `qmllint` is clean for
+`BubbleAnchorSlot.qml`, `PanelCluster.qml`, and `Panel.qml`.
+
+### The exact point this stopped
+
+The anchor exists and can describe itself, but nothing sends it yet.
+
+1. **Deliver the anchor to the selector.** `BubbleSelector.qml` is a separate
+   surface from the panel, so its `sendAction` cannot reach `bubbleAnchorSlot`.
+   It already receives `attachmentAnchorRect` when opened; the anchor needs an
+   equivalent route. Do not reuse `attachmentAnchor`: menu attachment and travel
+   destination are different concerns that happen to coincide today.
+2. **Originate a minimize.** `ShellService::Command` dispatches verbs centrally,
+   but the anchor lives in the panel, so `minimize` needs a route from the
+   service to the panel that owns the slot for the target window's output.
+   This is the piece with the most design freedom left; decide it deliberately.
+3. `celestina msg minimize` with strict option handling, and shell-side gating
+   on `providers["melibea"]["available"]` being the boolean `true`.
+4. QML tests for the slot, C++ tests for the new verb, the architecture and
+   documentation guards, and BUBBLE-2 / `VAL-BUBBLE-2` text.
 
 Then: a final adversarial review of the combined delta, the persistent
 pre-activation backup, and the single planned Niri restart.
+
+### Isolated-copy manifest
+
+```text
+copy:   /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-nest
+build:  /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-build
+patch:  /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-m7.patch
+bytes:  42426
+lines:  1006
+sha256: 65d665b149726f990a9e2e4fa1b9ff522b0a57496f7e6f1eb70037a11d551121
+scope:  9 files, 684 insertions, 34 deletions
+```
+
+This lives on persistent storage rather than `/tmp`, which is what destroyed the
+previous attempt. The index holds BUBBLE-1 plus the author's unrelated work, so
+the unstaged diff is exactly this delta; `BubbleAnchorSlot.qml` is intent-to-add
+and the patch carries its `new file mode` entry. It passes `git apply --check`
+against the real checkout and was deliberately not applied.
+
+### Environment warning
+
+`scripts/check-architecture-contract.sh` includes a QML visual contract that
+starts a QML engine. Running it without `QT_QPA_PLATFORM=offscreen` crashed the
+GPU on this machine mid-session. Force the offscreen platform for it and for
+every Qt test, and prefer bounded build parallelism over `-j$(nproc)`.
