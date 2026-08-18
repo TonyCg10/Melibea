@@ -1,0 +1,13 @@
+# Rules are resolved from top to bottom. If both matchers are present, both
+# must match. Widths accept a proportion, a percentage string, or "preserve".
+
+[[attention]]
+app_id = "^kitty$"
+focused_width = "50%"
+unfocused_width = "10%"
+
+[[attention]]
+app_id = "^code$"
+title = "Melibea"
+focused_width = 0.9
+unfocused_width = "preserve"

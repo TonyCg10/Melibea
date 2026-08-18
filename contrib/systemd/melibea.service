@@ -1,0 +1,15 @@
+[Unit]
+Description=Melibea focus-responsive geometry controller
+Documentation=https://github.com/TonyCg10/Melibea
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/melibea run
+Restart=on-failure
+RestartSec=1s
+StandardOutput=journal
+StandardError=journal
+
+# This unit is intentionally started by niri's spawn-at-startup rather than
+# enabled globally. That guarantees the current session has exported its
+# NIRI_SOCKET before Melibea starts.
