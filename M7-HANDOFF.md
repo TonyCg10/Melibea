@@ -1,5 +1,32 @@
 # M7 paused checkpoint and cross-session handoff
 
+> ## Superseded in part on 2026-08-18 after a reboot destroyed `/tmp`
+>
+> The machine rebooted at 13:25 on 2026-08-18 and emptied `/tmp`. Every volatile
+> artifact this document points at is gone and unrecoverable: the Niri M7 patch,
+> the preserved nested Niri binary, the nested harness, and the isolated
+> Celestina copy. All hashes and `/tmp` paths below are historical records, not
+> live truth.
+>
+> What survived, and what was rebuilt afterwards:
+>
+> - Melibea M7 is committed at `m7-protocol-v2` (`258cfb0`) instead of sitting
+>   uncommitted. Its wire form is unchanged.
+> - The Niri M6 baseline survived in `/home/toni/CODIGO/NIRI-MELIBEA` and the M7
+>   motion layer was **reimplemented from scratch** on top of it. It now lives in
+>   that real checkout as uncommitted work, not in a `/tmp` patch.
+> - The nested harness was rebuilt at
+>   `/home/toni/CODIGO/.m7-recovery-2026-08-18/nested/nest.py`, without Celestina.
+> - A persistent backup of both worktrees lives in
+>   `/home/toni/CODIGO/.m7-recovery-2026-08-18/`.
+>
+> The Celestina sections below (P2-A, P2-B, the completion sequence, and the
+> activation plan) are **still outstanding and were not attempted**. That work
+> must be reconstructed from the current real Celestina checkout, because the
+> isolated copy and its patch no longer exist.
+>
+> See "Reimplemented M7 state" at the end of this file for what is now true.
+
 **Checkpoint:** `M7-PAUSED-2026-08-18`
 
 **Authority:** the author explicitly paused the work and asked for a durable,
@@ -554,3 +581,93 @@ M7 is not complete until every item is true:
 
 Until those boxes are satisfied, the honest status remains: **M7 active,
 paused before final Celestina correction and isolated end-to-end validation**.
+
+
+## Reimplemented M7 state (2026-08-18, after the `/tmp` loss)
+
+### Melibea
+
+Committed on branch `m7-protocol-v2` as `258cfb0`. Unchanged in behavior:
+73 library tests, 12 binary tests, `cargo fmt --check`, and `git diff --check`
+all pass.
+
+### Niri
+
+The M7 motion layer was rewritten on the surviving M6 baseline in
+`/home/toni/CODIGO/NIRI-MELIBEA` (branch `codex/melibea-native-minimization`,
+uncommitted, per this document's dirty-worktree rules). It is materially
+smaller than the lost version because it reuses M6's existing close/open
+visuals rather than introducing a parallel animation path.
+
+Changes:
+
+- `niri-ipc`: `WindowTransition` (`anchored`/`disabled`) and `BubbleAnchor`,
+  plus an optional `transition` field on `MinimizeWindow`/`RestoreWindow`.
+  Legacy serialization is byte-identical and pinned by test.
+- `niri-config`: dedicated `MinimizeWindowWithTransition` /
+  `RestoreWindowWithTransition` variants, unreachable from a key bind, so the
+  bind-reachable variants keep their exact prior meaning.
+- `src/layout/window_transition.rs`: new module resolving a hint against live
+  output state and reprojecting an output-local anchor into workspace-local
+  coordinates. Every unusable case degrades to generic motion.
+- `Layout::resolve_window_transition` resolves at action time and stores
+  nothing.
+- `ClosingWindow` and `OpenAnimation` gained optional travel; both deliberately
+  bypass the close/open shaders, which are in-place dissolves that would fight a
+  trajectory.
+- `src/input/mod.rs`: the three duplicated minimize/restore arms were unified
+  into `act_minimize`/`act_restore`, which accept the hint.
+
+**One real integration defect was found and fixed.** Melibea already emitted
+`{"type":"anchored",...}` (internally tagged, lowercase) toward Niri, while the
+new `niri-ipc` enum defaulted to `{"Anchored":{...}}`. The two would not have
+interoperated. `niri-ipc` now uses `#[serde(tag = "type", rename_all =
+"lowercase")]`, matching the frozen shell-facing spelling, and both sides pin
+the exact string in tests.
+
+Evidence:
+
+- 140 layout tests pass, including 9 new `window_transition` unit tests and 6
+  new `Layout`-level tests.
+- 8 `niri-ipc` tests, its doctest, and 20 `niri-config` tests pass.
+- Strict Clippy is clean for `niri-ipc` and `niri-config`. The Niri lib reports
+  three warnings, all in files M7 does not touch
+  (`ipc/client.rs`, `protocols/ext_workspace.rs`,
+  `protocols/output_management.rs`).
+- `git diff --check` passes and the M7 files are rustfmt-clean.
+
+Not claimed: the EGL-backed Niri suite was not run, and `cargo fmt --all
+--check` still reports inherited drift in `src/protocols/foreign_toplevel.rs`,
+which M7 leaves untouched.
+
+### Nested validation
+
+`/home/toni/CODIGO/.m7-recovery-2026-08-18/nested/nest.py` rebuilds the isolated
+`dbus-run-session -> nested niri (winit) -> Melibea -> disposable client` harness
+and keeps the original invariants: no host `NIRI_SOCKET`, no HOME configuration
+edits, no user bus, no `systemctl`, and teardown that matches PID, `/proc` start
+time, command-line fragment, and private runtime directory before signalling
+anything. It uses no `pkill` or `killall`. Celestina is out of scope.
+
+All 12 checks pass against a real nested compositor:
+
+- protocol v1 rejects a `transition` field, and v1 without one still applies;
+- anchored minimize and restore apply, and the window really leaves and rejoins
+  the visible layout;
+- `disabled` minimize and restore apply and leave consistent state;
+- an unknown output falls back without failing the lifecycle change;
+- immediate minimize/restore reversal leaves no duplicate, ghost, or stale
+  minimized state;
+- protocol v1 `list` still works after v2 traffic.
+
+Exact v2 NDJSON is preserved per run under `evidence/protocol.ndjson`.
+
+**Not proven by this harness**, and still author-only validation: perceptual
+motion quality, multi-output hotplug and migration (winit exposes one output),
+and the one-frame ghost case, which needs screenshots rather than IPC state.
+
+### What M7 still needs
+
+- Celestina P2-A and P2-B, reconstructed from the real checkout.
+- A final adversarial review of the combined delta.
+- The persistent pre-activation backup and the single planned Niri restart.
