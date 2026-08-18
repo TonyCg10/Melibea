@@ -771,26 +771,81 @@ Evidence: 130 Rust tests in `celestina` and 346 in `celestina-shell-core` pass,
 strict Clippy is clean for both, and `qmllint` is clean for
 `BubbleAnchorSlot.qml`, `PanelCluster.qml`, and `Panel.qml`.
 
-### The exact point this stopped
+### Both plumbing routes are decided and wired
 
-The anchor exists and can describe itself, but nothing sends it yet.
+The two open questions were how the anchor reaches an action that has no anchor slot of
+its own. They were answered differently on purpose, because the two callers differ.
 
-1. **Deliver the anchor to the selector.** `BubbleSelector.qml` is a separate
-   surface from the panel, so its `sendAction` cannot reach `bubbleAnchorSlot`.
-   It already receives `attachmentAnchorRect` when opened; the anchor needs an
-   equivalent route. Do not reuse `attachmentAnchor`: menu attachment and travel
-   destination are different concerns that happen to coincide today.
-2. **Originate a minimize.** `ShellService::Command` dispatches verbs centrally,
-   but the anchor lives in the panel, so `minimize` needs a route from the
-   service to the panel that owns the slot for the target window's output.
-   This is the piece with the most design freedom left; decide it deliberately.
-3. `celestina msg minimize` with strict option handling, and shell-side gating
-   on `providers["melibea"]["available"]` being the boolean `true`.
-4. QML tests for the slot, C++ tests for the new verb, the architecture and
-   documentation guards, and BUBBLE-2 / `VAL-BUBBLE-2` text.
+**Restore, from the selector: a snapshot taken when the surface opens.** The selector is a
+separate surface from the panel, so the overlay controller reads `bubbleAnchorRect()` off
+the opener panel and hands it over as an initial property, exactly as it already hands over
+`openerRect` and `attachmentAnchorRect`. A snapshot is honest here: the overlay is anchored
+to that panel for its whole short life, so a panel that had moved would already have
+misplaced the card. Following the existing contract beat inventing a parallel live-query
+mechanism. The property is inserted only for `BubbleSelector`, since no other overlay
+declares it.
 
-Then: a final adversarial review of the combined delta, the persistent
-pre-activation backup, and the single planned Niri restart.
+Unlike every other rectangle on that path, it is **not** translated into the carrier: it
+stays in the compositor's output-local logical space, because it is going to Niri rather
+than into the surface's own layout.
+
+**Minimize, from a keybind or the CLI: a live query.** There is no surface to snapshot, so
+`ShellService` asks for the anchor at action time. It resolves the **focused output** from
+`NiriClient::focusedOutput()` — the focused window is the one Niri will minimize, so its
+monitor is the one whose bubbles it should travel to.
+
+`ShellService` does not take a `PanelManager` for this. It takes `BubbleAnchorSource`, a
+two-method interface in the spirit of `RequestSink`: one rectangle and one preference. That
+is what lets the verb's contract be tested without a QML engine, a screen, or a mapped
+panel — the shell-service test could not even link `panelmanager.cpp`.
+
+**A focused minimize names no window.** `Request::Minimize` carries
+`window_id: Option<u64>` and sends an explicit JSON `null`, which PROTOCOL.md defines as
+"resolve the focused window". This is not a convenience: reading focus in the shell and
+acting on it afterwards would race, and Niri is the only authority on what is focused at the
+instant the action lands. Melibea's reply names the window it resolved, and that resolved id
+is what the confirmation then watches for.
+
+Gating is strict: `providers["melibea"]["available"]` is checked as an actual boolean, since
+a truthy string would claim availability for a provider that had published nothing. A window
+id the caller does name must parse as an exact decimal. Every refusal is a D-Bus error
+through `refuse`, never a silent zero.
+
+`celestina msg minimize` needed no CLI registration: `msg` passes a verb straight to the
+service. It is documented in `celestina/README.md`.
+
+### Evidence
+
+All from the isolated copy, with `QT_QPA_PLATFORM=offscreen` forced throughout:
+
+- 14 shell-service tests, 14 provider-states tests, and 15 request-ledger tests pass; the
+  shell-service run used a private `dbus-run-session`.
+- 133 Rust tests in `celestina` and 347 in `celestina-shell-core` pass.
+- Strict Clippy is clean for both crates.
+- `qmllint` is clean for `BubbleAnchorSlot.qml`, `BubbleSelector.qml`, `BubbleGroup.qml`,
+  `Panel.qml`, and `PanelCluster.qml`.
+- The full `celestina` shell target builds.
+- The architecture contract passes. The language and documentation contracts report only
+  pre-existing debt in `siderita/`, which this delta does not touch.
+
+### What M7 still needs
+
+Nothing in this delta has been seen running. The remaining work is validation and
+activation, not construction:
+
+- QML tests for the anchor slot, and a `VAL-BUBBLE-2` matrix covering multi-output,
+  reduced motion, and assistive technology.
+- BUBBLE-2 plan, roadmap, and evidence text.
+- The nested end-to-end run: minimize ending at the bubble and restore beginning there for
+  the same window identity, plus disabled motion, invalid and removed outputs, immediate
+  reversal, tiled and floating windows, and transient families.
+- A final adversarial review of the combined delta.
+- The persistent pre-activation backup and the single planned Niri restart.
+
+One judgement to confirm with the author: the anchor slot reserves permanent panel space,
+so the bubble cluster no longer collapses to nothing when there are no minimized windows.
+`PanelCluster` gained `showsGlass` so no glass pill sits under it, but the reserved width
+is a visible layout decision and should be looked at on real hardware.
 
 ### Isolated-copy manifest
 
@@ -798,16 +853,17 @@ pre-activation backup, and the single planned Niri restart.
 copy:   /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-nest
 build:  /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-build
 patch:  /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-m7.patch
-bytes:  42426
-lines:  1006
-sha256: 65d665b149726f990a9e2e4fa1b9ff522b0a57496f7e6f1eb70037a11d551121
-scope:  9 files, 684 insertions, 34 deletions
+bytes:  67536
+lines:  1576
+sha256: 2724432f5baa282972dd18f095b0a5f9888cc2662c8fb805092cc4337a5c419d
+scope:  21 files, 1028 insertions, 42 deletions
 ```
 
 This lives on persistent storage rather than `/tmp`, which is what destroyed the
 previous attempt. The index holds BUBBLE-1 plus the author's unrelated work, so
-the unstaged diff is exactly this delta; `BubbleAnchorSlot.qml` is intent-to-add
-and the patch carries its `new file mode` entry. It passes `git apply --check`
+the unstaged diff is exactly this delta; `BubbleAnchorSlot.qml` and
+`bubbleanchorsource.h` are intent-to-add, so the patch carries both
+`new file mode` entries. It passes `git apply --check`
 against the real checkout and was deliberately not applied.
 
 ### Environment warning
