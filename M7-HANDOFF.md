@@ -666,8 +666,77 @@ Exact v2 NDJSON is preserved per run under `evidence/protocol.ndjson`.
 motion quality, multi-output hotplug and migration (winit exposes one output),
 and the one-frame ghost case, which needs screenshots rather than IPC state.
 
+### Celestina: both P2 items are done, in an isolated copy only
+
+Work happened exclusively in `/home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-nest`,
+a copy of the real worktree whose index holds BUBBLE-1 plus the author's
+unrelated work as the baseline, so the unstaged diff is exactly the new delta.
+**The real checkout at `/home/toni/CODIGO/CELESTINA` was never modified**, and
+nothing was applied, built into, or deployed from it.
+
+Both defects turned out to be **live in the deployed BUBBLE-1 baseline**, not
+merely artifacts of the lost M7 copy. The handoff described them as M7 findings
+because that is where they were noticed.
+
+**P2-B — the host dropped every terminal `confirmed`.** `celestina-shell-core`
+emits `state: "confirmed"` for any provider whose effect something still has to
+observe, while `readResult` admitted only `accepted` and `failed` and turned the
+confirmation into an invalid frame. `RequestLedger::result` already handled
+`confirmed` correctly, so the fix is confined to the parser. The reason this
+survived is that `requestledger_test.cpp` drove the ledger directly and never
+crossed the parser; the new regression drives the same decision
+`ShellProvidersClient::applyLine` makes on each line, so the join is covered.
+Both new tests were verified to fail with the fix reverted and pass with it.
+
+**P2-A — an action could run without an authoritative projection.**
+`request_action` connected and acted first, and capacity was only checked
+afterwards in `reserve`, so a refused action could already have moved a window
+in Niri. `BridgeState::can_dispatch` now rejects a withdrawn projection, a full
+pending table, and a duplicate request id, and `request_action` validates and
+encodes before calling it immediately ahead of `UnixStream::connect`. Losing the
+projection after that guard remains an ordinary race handled by reserve/arm,
+reconnection failure, and the bounded timeout; no accepted Niri state change is
+rolled back.
+
+Evidence, all from the isolated copy:
+
+- 14 provider-states tests and 15 request-ledger tests pass under
+  `QT_QPA_PLATFORM=offscreen`.
+- 129 Rust tests pass and strict Clippy is clean.
+- The architecture contract passes. The language contract reports only
+  pre-existing debt in `siderita/`, which this delta does not touch.
+- `git diff --check` passes.
+
+Incremental patch, containing only the five files this work changed and none of
+the BUBBLE-1 baseline or unrelated author work:
+
+```text
+path:   /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-p2-fixes.patch
+bytes:  13618
+lines:  299
+sha256: b0fe1d2ef58ffbb8077df9bd649546eef49d627f11397f7f6dea237ff03bdffe
+scope:  5 files, 185 insertions, 7 deletions
+```
+
+It passes `git apply --check` against the real checkout. It was deliberately
+**not** applied.
+
 ### What M7 still needs
 
-- Celestina P2-A and P2-B, reconstructed from the real checkout.
-- A final adversarial review of the combined delta.
-- The persistent pre-activation backup and the single planned Niri restart.
+The Celestina M7 delta itself was lost with `/tmp` and has **not** been
+rewritten. BUBBLE-1 has no notion of a transition, and
+`ClientEnvelope::action` still returns `None` for `Operation::Minimize`, so the
+shell cannot originate a minimize at all. Rebuilding it means:
+
+- protocol v2 in `celestina-shell-core::melibea`: version negotiation,
+  `WindowTransition`/`BubbleAnchor`, and a minimize request;
+- the `minimize` verb in the provider adapter, with the anchor queried at
+  action time and reduced motion forwarded as `disabled`;
+- the permanent 22x22 non-painting bubble slot, present before the first bubble
+  and stable at the front edge as the group grows;
+- `celestina msg minimize`, per-operation provider option keys, and shell-side
+  gating on `providers["melibea"]["available"]` being boolean `true`;
+- BUBBLE-2 plan, roadmap, and `VAL-BUBBLE-2` coverage.
+
+Then: a final adversarial review of the combined delta, the persistent
+pre-activation backup, and the single planned Niri restart.
