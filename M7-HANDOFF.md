@@ -828,17 +828,42 @@ All from the isolated copy, with `QT_QPA_PLATFORM=offscreen` forced throughout:
 - The architecture contract passes. The language and documentation contracts report only
   pre-existing debt in `siderita/`, which this delta does not touch.
 
-### What M7 still needs
+### The nested matrix passed
 
-Nothing in this delta has been seen running. The remaining work is validation and
-activation, not construction:
+Run `run-20260818-153357` under `/home/toni/CODIGO/.m7-recovery-2026-08-18/nested`, against
+the debug Niri and Melibea binaries built at 14:18 from the current M7 source. All 12 checks
+passed and the nested Niri log contains no panic or error.
+
+What it proved on real compositor traffic, with the exact wire bytes preserved in
+`evidence/protocol.ndjson`:
+
+- v1 **rejects** a transition field rather than ignoring it, answering `invalid_request`
+  with "window transitions require Melibea protocol version 2";
+- a v1 minimize and restore with no transition still apply, byte-identical to before;
+- anchored minimize and restore apply under v2, and the window really leaves and re-enters
+  the visible layout (`minimized=[2]`, then empty);
+- `disabled` applies and leaves state consistent;
+- an anchor naming an output that does not exist still returns `applied` — it degrades to
+  Niri's ordinary motion and never blocks or reverses the lifecycle change;
+- an immediate reversal leaves no duplicate and no ghost (`minimized=[2] visible=[]`);
+- a protocol-v1 `list` still works after v2 traffic on the same daemon.
+
+Melibea published ten ordered revisions across the cycles, alternating one bubble and none.
+
+**Scope limit, stated plainly:** this harness exercises Melibea against Niri only. Celestina
+is deliberately out of it, so none of the Celestina delta — the anchor slot, the two anchor
+routes, the shell-originated minimize — has been seen running. Its evidence is still only
+unit-level.
+
+### What M7 still needs
 
 - QML tests for the anchor slot, and a `VAL-BUBBLE-2` matrix covering multi-output,
   reduced motion, and assistive technology.
 - BUBBLE-2 plan, roadmap, and evidence text.
-- The nested end-to-end run: minimize ending at the bubble and restore beginning there for
-  the same window identity, plus disabled motion, invalid and removed outputs, immediate
-  reversal, tiled and floating windows, and transient families.
+- A combined nested run that includes Celestina, which is what would actually show a
+  minimize ending at the bubble and a restore beginning there.
+- Tiled and floating windows and transient families, which the current matrix does not
+  separate.
 - A final adversarial review of the combined delta.
 - The persistent pre-activation backup and the single planned Niri restart.
 
