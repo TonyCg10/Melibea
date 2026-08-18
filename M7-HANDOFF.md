@@ -828,42 +828,65 @@ All from the isolated copy, with `QT_QPA_PLATFORM=offscreen` forced throughout:
 - The architecture contract passes. The language and documentation contracts report only
   pre-existing debt in `siderita/`, which this delta does not touch.
 
-### The nested matrix passed
+### The nested matrix passed, with Celestina inside it
 
-Run `run-20260818-153357` under `/home/toni/CODIGO/.m7-recovery-2026-08-18/nested`, against
-the debug Niri and Melibea binaries built at 14:18 from the current M7 source. All 12 checks
-passed and the nested Niri log contains no panic or error.
+Run `run-20260818-154126` under `/home/toni/CODIGO/.m7-recovery-2026-08-18/nested`. All 23
+checks passed. Neither the nested Niri log nor Celestina's log contains a panic, warning, or
+critical.
 
-What it proved on real compositor traffic, with the exact wire bytes preserved in
-`evidence/protocol.ndjson`:
+The harness now runs the whole stack: a private `dbus-daemon` session, the real Celestina
+shell and its provider adapter as Wayland clients of the nested Niri, and **an exact-byte
+Unix proxy standing where the shell thinks Melibea is**. The proxy forwards every byte
+verbatim and never parses, buffers by line, or reframes — a proxy that understood the
+protocol could hide a framing defect in the very thing it exists to observe. Asking the shell
+what it meant to send would prove nothing; the recorded bytes are the evidence.
 
-- v1 **rejects** a transition field rather than ignoring it, answering `invalid_request`
-  with "window transitions require Melibea protocol version 2";
-- a v1 minimize and restore with no transition still apply, byte-identical to before;
-- anchored minimize and restore apply under v2, and the window really leaves and re-enters
-  the visible layout (`minimized=[2]`, then empty);
-- `disabled` applies and leaves state consistent;
-- an anchor naming an output that does not exist still returns `applied` — it degrades to
-  Niri's ordinary motion and never blocks or reverses the lifecycle change;
-- an immediate reversal leaves no duplicate and no ghost (`minimized=[2] visible=[]`);
-- a protocol-v1 `list` still works after v2 traffic on the same daemon.
+What the shell actually wrote, from `evidence/celestina-protocol.ndjson`:
 
-Melibea published ten ordered revisions across the cycles, alternating one bubble and none.
+```text
+C> {"version":1,"request":{"type":"subscribe"}}
+C> {"version":2,"request":{"type":"minimize","window_id":null,
+   "transition":{"type":"anchored","anchor":{"output":"winit",
+   "x":652.0,"y":9.0,"width":22.0,"height":22.0}}}}
+```
 
-**Scope limit, stated plainly:** this harness exercises Melibea against Niri only. Celestina
-is deliberately out of it, so none of the Celestina delta — the anchor slot, the two anchor
-routes, the shell-originated minimize — has been seen running. Its evidence is still only
-unit-level.
+Every M7 claim about the shell is visible in those two lines: the subscription stays on the
+frozen v1 contract, a hint is what moves a request to v2, the shell asks Niri to resolve the
+focused window with an explicit null rather than an omitted field, and the anchor is the
+permanent 22x22 slot named on the output the shell drew on, at coordinates inside that
+output's 1280x720 box — which is what says the origin really was subtracted.
+
+Melibea answered `applied` with `requested_id: null, window_id: 2`, the window left the
+layout, and revision 12 added it to the shell's bubble state.
+
+### The defect this run found
+
+`celestina msg minimize` hung for its full timeout even though the minimize had already
+succeeded. The verb returned the *provider helper's* request id directly, while every other
+provider-backed verb answers under a shell id and maps the two, so the caller waited for a
+`CommandResult` that was never going to carry that id.
+
+The fix follows the existing `m_actionRequests` pattern, but in a **separate** map: the
+compositor adapter and the provider helper number their requests independently, both from
+one, so sharing a map would answer the wrong caller as soon as the two counters met.
+Acceptance is deliberately not reported — `accepted` only says the helper ran a tool, and
+reporting it would tell `celestina msg` a minimize had succeeded before Niri had done it.
+
+Only an end-to-end run could have found this: every unit test passed before and after, since
+the defect lived in the seam between two components that are individually correct.
 
 ### What M7 still needs
 
 - QML tests for the anchor slot, and a `VAL-BUBBLE-2` matrix covering multi-output,
   reduced motion, and assistive technology.
 - BUBBLE-2 plan, roadmap, and evidence text.
-- A combined nested run that includes Celestina, which is what would actually show a
-  minimize ending at the bubble and a restore beginning there.
+- Restoring through the selector. The harness drives a restore through Melibea directly and
+  checks the shell follows it, but the selector's own route — the anchor snapshot it
+  receives when it opens — needs synthesised input the harness does not produce.
 - Tiled and floating windows and transient families, which the current matrix does not
   separate.
+- Whether the travel is actually *seen*. Every check here is state and wire form; no test
+  asserts that anything visually moved.
 - A final adversarial review of the combined delta.
 - The persistent pre-activation backup and the single planned Niri restart.
 
@@ -878,10 +901,10 @@ is a visible layout decision and should be looked at on real hardware.
 copy:   /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-nest
 build:  /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-build
 patch:  /home/toni/CODIGO/.m7-recovery-2026-08-18/celestina-m7.patch
-bytes:  67536
-lines:  1576
-sha256: 2724432f5baa282972dd18f095b0a5f9888cc2662c8fb805092cc4337a5c419d
-scope:  21 files, 1028 insertions, 42 deletions
+bytes:  70197
+lines:  1637
+sha256: b00323a8ac58479079200659cb2b4b01a75d50809887f9d3917e9a1aa5c2453d
+scope:  21 files, 1068 insertions, 42 deletions
 ```
 
 This lives on persistent storage rather than `/tmp`, which is what destroyed the
