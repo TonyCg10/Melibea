@@ -13,12 +13,15 @@ Native minimization now continues alongside the deployed geometry trial.
 A separate niri 26.04 branch provides native minimize, restore, close, query,
 events, transient-family handling, relational restoration, and compositor-local
 motion without using a hidden workspace. `melibea run` projects its state over
-protocol v1 with gapless subscriptions and semantic actions. Celestina 0.32.0
-uses that public boundary for its compact overlapping bubble group and
-selector. The author confirmed that icons and titles need no preview; active M7
-work adds only a backward-compatible protocol-v2 motion hint and coordinated
-window-to-bubble travel. The compositor patch remains an experimental
-maintained checkout.
+protocol v1 with gapless subscriptions and semantic actions, extended by a
+backward-compatible protocol-v2 motion hint for coordinated window-to-bubble
+travel. Celestina 1.0.0 uses that public boundary for its compact overlapping
+bubble group and selector, and downgrades to protocol v1 without the hint when
+a Melibea it talks to does not speak v2, so minimize and restore keep working
+without the travel. The author confirmed that icons and titles need no
+preview. The compositor patch remains an experimental maintained checkout; see
+[ROADMAP.md](ROADMAP.md) for what is validated in a nested harness versus
+deployed in the real session.
 
 ## Configuration
 

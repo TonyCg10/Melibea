@@ -537,7 +537,7 @@ complete `VAL-BUBBLE-1` matrix.
 
 ## M7 — Coordinated bubble motion
 
-**Status:** active
+**Status:** complete, with one exit criterion deferred
 
 **Estimated effort:** several focused sessions to two weeks
 
@@ -605,6 +605,25 @@ leave a duplicate surface, closing ghost, or stale minimized state.
 
 Melibea will not grant arbitrary clients access to other applications' surface
 pixels.
+
+### Deployed state at close, 2026-08-19
+
+Protocol v2 is implemented and tested end-to-end in a nested harness (41 of 41
+checks: version negotiation, anchored and disabled motion, tiled, floating, and
+transient-family minimize/restore, and the real Celestina shell driven with
+key input). Celestina 1.0.0 speaks it, including a downgrade: when Melibea
+answers `incompatible_version`, the same action is resent under protocol v1
+without the transition, since a refused envelope means nothing moved and
+resending is safe.
+
+The real session's installed Melibea and the companion Niri M7 patch were
+**not** rebuilt or redeployed in this closing session; the Niri M7 source
+copy was lost with `/tmp` per [M7-HANDOFF.md](M7-HANDOFF.md) and was never
+reconstructed. Minimize and restore work today in the real session through
+that v1 downgrade path — correctly, but without the coordinated visual
+travel this milestone was built to add. The fifth exit criterion above, "a
+nested session shows minimize ending at the bubble," was met only inside the
+harness, not in the deployed session.
 
 ## M8 — Optional expansions
 
