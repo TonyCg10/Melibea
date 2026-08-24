@@ -15,9 +15,16 @@ M0 Foundation (done)
       -> M4 Usable native minimization (complete)
       -> M5 Versioned shell contract (complete)
       -> M6 Celestina bubble integration (complete)
-      -> M7 Coordinated bubble motion (active)
+      -> M7 Coordinated bubble motion (complete, one criterion deferred)
       -> M8 Optional expansions
+  -> M9 Screen magnifier (planned, in the Niri fork)
+      -> M10 Screen ruler companion binary (planned)
 ```
+
+M9 and M10 are session tools rather than surface-state work, so they sit
+outside the M1-M8 line. M9 lives in the Niri fork because only a compositor can
+magnify without capturing; M10 is a client and touches neither Niri nor the
+`melibea` daemon.
 
 ## M0 — Foundation
 
@@ -639,6 +646,114 @@ Candidates, admitted only by demonstrated daily value:
 - Upstreamable general niri actions discovered by Melibea.
 
 Each candidate requires its own active milestone before implementation.
+
+## M9 — Screen magnifier in the compositor
+
+**Status:** planned
+
+**Estimated effort:** one to two focused sessions
+
+### Outcome
+
+A key magnifies the region around the pointer, live, without capturing or
+copying the screen.
+
+### Why this belongs in the compositor
+
+A magnifier has to show the screen enlarged *continuously*. An external client
+could screencopy at 60 fps and redraw into a window, but it would trail a frame
+behind, capture itself into a feedback loop, pay a full readback every frame,
+and take part in layout and focus like any other window.
+
+Niri instead already treats zoom as a render transform. The overview zooms
+whole workspaces through `Monitor::overview_zoom` and `workspace_size(zoom)`;
+nothing is read back, because the compositor simply draws differently. The
+magnifier reuses that transform, anchored to the pointer rather than to a
+workspace.
+
+### In
+
+- A configurable `window-zoom`-style animation, following the pattern
+  `window-focus-change` established in the Niri fork.
+- Bind actions to zoom in, zoom out, and reset.
+- The magnified region follows the pointer, clamped to the current output.
+- Zoom applies per output, since outputs differ in scale and resolution.
+
+### Out
+
+- Zooming individual windows rather than screen regions.
+- Smoothing or upscaling filters beyond what the existing transform gives.
+- Any capture, screenshot, or readback path. If a frame is being copied, this
+  is the wrong design.
+
+### Exit
+
+- Zooming in and out is animated rather than stepped.
+- The pointer stays under the cursor's real position at every zoom level.
+- Other outputs are unaffected while one is magnified.
+- Screencasting and screenshots capture the unmagnified screen, because
+  magnification is presentation, not state.
+
+## M10 — Screen ruler as a companion binary
+
+**Status:** planned
+
+**Estimated effort:** one to two focused sessions after M9
+
+### Outcome
+
+Measuring distances on screen in pixels, with edges found automatically rather
+than eyeballed, in the spirit of PowerToys' Screen Ruler.
+
+### Why a second binary rather than a plugin
+
+`Add no plugin framework` remains a settled decision: a loader, a stable API,
+and versioning are infrastructure for many consumers, and this has one. This
+milestone adds no extension point of any kind.
+
+It is also not part of the `melibea` daemon. That daemon has no graphical code
+at all — its whole dependency list is `regex`, `serde`, `serde_json` and
+`toml` — while a ruler needs a layer-shell surface, drawing, pointer grabs, and
+pixel reads. Those belong to a client, not to a surface-state controller.
+
+So `melibea-ruler` is a separate program that happens to live in this
+repository: one repository, two binaries, no framework, and no daemon carrying a
+rendering stack it never uses.
+
+### In
+
+- A layer-shell overlay that measures between two points in logical pixels.
+- Edge detection by colour difference, with an adjustable tolerance, so a
+  bounding box can be found from one point inside it.
+- Bounding-box, horizontal-only, and vertical-only measurements.
+- Copying a measurement to the clipboard.
+- Per-output correctness on mixed-DPI outputs, reporting logical pixels and
+  naming the output.
+
+### Out
+
+- Any dependency on the `melibea` daemon. The ruler measures pixels; it has
+  nothing to say about window state, and must run with the daemon stopped.
+- Any dependency on Celestina or another shell.
+- Annotation, drawing, or screenshot editing.
+- Colour picking and OCR, which the session already answers: `PickColor` is a
+  native Niri IPC action, and screencopy plus an OCR program covers text.
+
+### Licence boundary to settle first
+
+Reading pixels means speaking `wlr-screencopy`. Melibea deliberately
+implements Niri's wire protocol directly rather than linking the GPL
+`niri-ipc` crate, to stay MIT. The same question has to be answered for
+whichever screencopy client library this uses **before** any code is written;
+if the only practical binding is GPL, then either the ruler is not MIT, or it
+does not live here.
+
+### Exit
+
+- A measurement matches a known-size window to the pixel.
+- Edge detection finds a real UI element's bounds from a point inside it.
+- It works on each output of a mixed-DPI, mixed-refresh session.
+- It runs with `melibea.service` stopped.
 
 ## Global non-goals
 

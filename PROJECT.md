@@ -102,6 +102,9 @@ hint but never stores it; niri remains the only renderer and lifecycle owner.
 | Treat visual clipping as a later native experiment | It crosses layout, rendering, input, and camera boundaries. |
 | Keep one active milestone | The project is currently a focused solo experiment. |
 | Add no plugin framework | Melibea has two product goals, not an open-ended extension platform. |
+| Ship the screen ruler as a second binary rather than a plugin or a new repository | A loader, a stable API and versioning are infrastructure for many consumers, and this has one. Two binaries in one repository add no extension point and spare the daemon a rendering stack it never uses. |
+| Keep the ruler out of the `melibea` daemon | The daemon depends only on `regex`, `serde`, `serde_json` and `toml`, and owns no graphical code. A ruler needs a layer-shell surface, drawing, pointer grabs and pixel reads; those belong to a client. |
+| Put the magnifier in the Niri fork, not in a client | Magnifying is a render transform the compositor already performs for the overview. A client would have to copy the screen every frame, trail a frame behind, and capture itself. |
 | Keep the MIT license and implement the small niri wire protocol directly | Linking the GPL niri-ipc crate would change Melibea's licensing; the required protocol subset is small and testable. |
 | Use targeted `SetWindowWidth` actions | `SetColumnWidth` operates on whichever column is focused when handled; a window id avoids mutating the wrong target after rapid focus changes. |
 | Keep minimized surfaces native to niri and bubble presentation outside niri | The compositor must own rendering, input exclusion, focus, and surface lifetime; Melibea projects deterministic state and a shell only renders it. |
