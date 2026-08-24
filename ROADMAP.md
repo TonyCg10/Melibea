@@ -19,12 +19,12 @@ M0 Foundation (done)
       -> M8 Optional expansions
   -> M9 Screen magnifier (planned, in the Niri fork)
       -> M10 Screen ruler companion binary (planned)
+  -> M11 Binding modes (planned, in the Niri fork)
 ```
 
-M9 and M10 are session tools rather than surface-state work, so they sit
-outside the M1-M8 line. M9 lives in the Niri fork because only a compositor can
-magnify without capturing; M10 is a client and touches neither Niri nor the
-`melibea` daemon.
+M9, M10 and M11 are session tools rather than surface-state work, so they sit
+outside the M1-M8 line. M9 and M11 live in the Niri fork, which owns rendering
+and input; M10 is a client and touches neither Niri nor the `melibea` daemon.
 
 ## M0 — Foundation
 
@@ -754,6 +754,69 @@ does not live here.
 - Edge detection finds a real UI element's bounds from a point inside it.
 - It works on each output of a mixed-DPI, mixed-refresh session.
 - It runs with `melibea.service` stopped.
+
+## M11 — Binding modes in the compositor
+
+**Status:** planned
+
+**Estimated effort:** one to two focused sessions
+
+### Outcome
+
+A key enters a named mode in which the plain keys mean something else, and
+another leaves it, in the shape i3 and Sway have had for years.
+
+### The problem, from the session's own configuration
+
+The live configuration holds 46 binds, and whole groups of them differ only by
+how many modifiers are stacked:
+
+```text
+Mod+Shift+Left/Down/Up/Right       focus-monitor-*
+Mod+Shift+Ctrl+Left/Down/Up/Right  move-column-to-monitor-*
+Mod+Shift+1 / 2 / 3                blackout HDMI-A-1 / DP-1 / DP-2
+```
+
+The second row is four keys at once. The third encodes a mapping — 1 is HDMI,
+2 is DP-1, 3 is DP-2 — that is written down nowhere except in the author's
+memory. Inside a mode the plain keys are free again, so an arrow can mean
+"move the column to that monitor" because the mode already says so, and the
+mode can be announced on screen instead of memorised.
+
+### In
+
+- Named modes in the configuration, each with its own binds.
+- Actions to enter a mode, leave it, and switch directly between modes.
+- An IPC event when the active mode changes, so a shell can draw an
+  indicator. Without this the feature is only half of what makes it usable in
+  i3 and Sway.
+- A per-mode option for whether a bind leaves the mode after firing, since
+  "resize repeatedly" and "pick one monitor and be done" want opposite
+  behaviour.
+
+### Out
+
+- Timeouts that leave a mode on their own; leaving is an explicit act.
+- Modes that change pointer or gesture behaviour. Keys only.
+- Rewriting the existing flat binds. This adds a capability; migrating the
+  configuration to it is a separate, unhurried decision.
+
+### The escape hatch is a correctness requirement
+
+A mode with no way out is a captured keyboard, and the only remedy left to the
+person is a TTY. So an unconditional exit must exist whether or not the
+configuration asks for one: an escape binding is implied in every mode, and a
+mode that somehow defines none is a configuration error caught at parse time,
+not at runtime. This is an exit criterion rather than a nicety.
+
+### Exit
+
+- Entering a mode makes its binds live and the ordinary ones dormant.
+- Escape leaves any mode, including one whose configuration forgot to say so.
+- A mode change emits an IPC event carrying the mode's name.
+- A configuration with no modes behaves exactly as it does today.
+- Reloading the configuration while inside a mode leaves the session in a
+  defined state rather than in a mode that no longer exists.
 
 ## Global non-goals
 
