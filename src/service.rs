@@ -510,6 +510,9 @@ impl BrokerState {
                 if write_message(stream, &ServerMessage::for_version(version, message)).is_ok()
                     && let Ok(subscriber) = stream.try_clone()
                 {
+                    // The set only grows here, so bounding it here bounds it
+                    // always: a client that reconnects clears its own corpses.
+                    self.sweep_departed();
                     self.subscribers.push(Subscriber {
                         version,
                         stream: subscriber,
@@ -544,6 +547,53 @@ impl BrokerState {
             .is_ok()
         });
     }
+
+    /// Drop subscribers whose peer has gone.
+    ///
+    /// A failed write already retires a subscriber, but that only happens when
+    /// there is something to broadcast. On an idle desktop nothing is, so a
+    /// client that reconnects — as any client with a reconnect loop does — has
+    /// its abandoned connections held here indefinitely, one descriptor each,
+    /// until the process runs out and `accept` starts failing with `EMFILE`.
+    /// The socket then stops answering for reasons that have nothing to do with
+    /// the client asking.
+    fn sweep_departed(&mut self) {
+        self.subscribers
+            .retain_mut(|subscriber| !subscriber_departed(&mut subscriber.stream));
+    }
+}
+
+/// Whether a subscriber's peer has closed its end.
+///
+/// A subscriber sends its one request and then only reads, so a readable stream
+/// means the connection ended rather than that a request arrived: `Ok(0)` is the
+/// peer's close. Bytes beyond the first request violate the one-request-per-
+/// connection rule; they are ignored rather than punished, because this is a
+/// liveness check and not a parser.
+fn subscriber_departed(stream: &mut UnixStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        // A stream that will not take the option is not one to keep guessing at.
+        return true;
+    }
+
+    let mut probe = [0_u8; 64];
+    let departed = match stream.read(&mut probe) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error) => !matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ),
+    };
+
+    // Writes must stay blocking: `broadcast` relies on `write_all` running to
+    // completion, and against a non-blocking socket a subscriber whose buffer
+    // was briefly full would be retired for being slow rather than gone.
+    if stream.set_nonblocking(false).is_err() {
+        return true;
+    }
+
+    departed
 }
 
 fn write_message(stream: &mut UnixStream, message: &ServerMessage) -> io::Result<()> {
@@ -831,7 +881,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{Service, ServiceClient, accept_error_is_fatal};
+    use super::{BrokerState, Service, ServiceClient, Subscriber, accept_error_is_fatal};
     use crate::{
         minimization::MinimizedWindow,
         protocol::{
@@ -1178,6 +1228,49 @@ mod tests {
                     && error.supported_versions
                         == SUPPORTED_PROTOCOL_VERSIONS.to_vec()
         ));
+    }
+
+    #[test]
+    fn abandoned_subscriptions_do_not_accumulate() {
+        // A client with a reconnect loop leaves a connection behind every time.
+        // Nothing is broadcast on an idle desktop, so without an explicit sweep
+        // each corpse holds a descriptor until the daemon cannot accept at all.
+        let mut state = BrokerState::default();
+        let mut kept_peer = None;
+
+        for index in 0..50 {
+            let (ours, theirs) = UnixStream::pair().expect("socket pair");
+            state.subscribers.push(Subscriber {
+                version: PROTOCOL_VERSION,
+                stream: ours,
+            });
+            if index == 0 {
+                // One peer stays alive; the rest are dropped where they stand.
+                kept_peer = Some(theirs);
+            }
+        }
+        assert_eq!(state.subscribers.len(), 50);
+
+        state.sweep_departed();
+        assert_eq!(
+            state.subscribers.len(),
+            1,
+            "only the subscriber whose peer is still there may survive"
+        );
+
+        // The sweep may not consume the stream it checks: a surviving subscriber
+        // must still receive everything broadcast afterwards.
+        state.broadcast(&Message::Snapshot {
+            revision: 7,
+            windows: vec![crate::protocol::Window::from(&window(1, "One"))],
+        });
+        let mut reader = BufReader::new(kept_peer.take().expect("kept peer"));
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("broadcast arrives");
+        assert!(
+            line.contains("\"revision\":7"),
+            "survivor must still receive state, got {line}"
+        );
     }
 
     #[test]
