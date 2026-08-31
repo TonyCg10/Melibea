@@ -227,18 +227,75 @@ fn prepare_socket_path(path: &Path) -> Result<(), ServiceError> {
     })
 }
 
+/// Whether an `accept` failure means the listener itself is gone.
+///
+/// Only a broken descriptor qualifies. Everything else `accept` can report is
+/// transient: a peer that vanished between its `connect` and this `accept`
+/// (`ECONNABORTED`), a signal (`EINTR`), or a momentary descriptor shortage
+/// (`EMFILE`/`ENFILE`). Retiring the listener on one of those would leave the
+/// daemon running and mirroring niri while nothing answers the socket, and the
+/// socket file still on disk — so every client gets `Connection refused` until
+/// the next restart, with no way back. A condition that resolves by itself must
+/// not be able to end the service's only reason to exist.
+///
+/// Linux errno values; this daemon does not target another platform.
+fn accept_error_is_fatal(error: &io::Error) -> bool {
+    const EBADF: i32 = 9;
+    const EINVAL: i32 = 22;
+    const ENOTSOCK: i32 = 88;
+
+    matches!(error.raw_os_error(), Some(EBADF | EINVAL | ENOTSOCK))
+}
+
+/// Report on stderr, where systemd captures it. The daemon's own `errorln!`
+/// lives in the binary crate, and this module is reached from tests too.
+fn report(message: &str) {
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "{message}");
+    let _ = stderr.flush();
+}
+
 fn accept_loop(listener: &UnixListener, sender: &Sender<BrokerMessage>, running: &AtomicBool) {
+    // Repeating the same condition every poll would flood the journal, so a
+    // given errno is reported once until a different one occurs.
+    let mut reported: Option<i32> = None;
+
     while running.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
+                reported = None;
                 let sender = sender.clone();
                 thread::spawn(move || read_client_request(stream, &sender));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(ACCEPT_POLL_INTERVAL);
             }
-            Err(_) => break,
+            Err(error) if accept_error_is_fatal(&error) => {
+                report(&format!(
+                    "accept failed unrecoverably ({error}); the socket will not answer again \
+                     until Melibea restarts"
+                ));
+                break;
+            }
+            // Transient: wait out the same poll interval and keep listening, so
+            // a repeating condition degrades to a slow accept rather than to a
+            // dead socket or a busy spin.
+            Err(error) => {
+                let errno = error.raw_os_error();
+                if reported != errno {
+                    reported = errno;
+                    report(&format!("accept failed ({error}); still listening"));
+                }
+                thread::sleep(ACCEPT_POLL_INTERVAL);
+            }
         }
+    }
+
+    // Reached on shutdown, and on the fatal branch above. Anything else that can
+    // end this thread ends the socket with it, so say so either way: a daemon
+    // that has stopped answering must not do it silently.
+    if running.load(Ordering::Acquire) {
+        report("accept loop stopped while the service was still running");
     }
 }
 
@@ -766,7 +823,7 @@ impl Error for ClientError {}
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs, io,
         io::{BufRead, BufReader, Write},
         os::unix::net::UnixStream,
         path::PathBuf,
@@ -774,7 +831,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{Service, ServiceClient};
+    use super::{Service, ServiceClient, accept_error_is_fatal};
     use crate::{
         minimization::MinimizedWindow,
         protocol::{
@@ -1121,6 +1178,40 @@ mod tests {
                     && error.supported_versions
                         == SUPPORTED_PROTOCOL_VERSIONS.to_vec()
         ));
+    }
+
+    #[test]
+    fn transient_accept_errors_never_retire_the_listener() {
+        // A peer that vanished between its connect and this accept, a signal,
+        // and a descriptor shortage all resolve by themselves. Retiring the
+        // listener on one of them leaves the daemon running with nothing
+        // answering the socket, which no client can recover from.
+        for errno in [
+            53,  // ECONNABORTED
+            4,   // EINTR
+            24,  // EMFILE
+            23,  // ENFILE
+            105, // ENOBUFS
+            12,  // ENOMEM
+        ] {
+            assert!(
+                !accept_error_is_fatal(&io::Error::from_raw_os_error(errno)),
+                "errno {errno} must not retire the listener"
+            );
+        }
+
+        // Only a listener that is no longer a usable socket is worth stopping
+        // for: retrying those spins forever on a descriptor that cannot recover.
+        for errno in [
+            9,  // EBADF
+            22, // EINVAL
+            88, // ENOTSOCK
+        ] {
+            assert!(
+                accept_error_is_fatal(&io::Error::from_raw_os_error(errno)),
+                "errno {errno} must retire the listener"
+            );
+        }
     }
 
     #[test]
