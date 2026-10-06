@@ -78,6 +78,18 @@ known-good policy or stops the controller.
 
 ## Daily trial
 
+Build and install the binary with:
+
+```sh
+scripts/install.sh
+```
+
+It builds in release, installs `~/.local/bin/melibea` (or
+`$MELIBEA_PREFIX/bin/melibea`) by an atomic rename, checks the installed bytes
+against the build, and then removes `target/`, which nothing reads after the
+install and the next build regenerates. `--keep-target` leaves it. A running
+daemon keeps the previous binary until it restarts.
+
 The repository includes [`contrib/systemd/melibea.service`](contrib/systemd/melibea.service).
 Install it as a user unit, then let niri restart it at session startup:
 
