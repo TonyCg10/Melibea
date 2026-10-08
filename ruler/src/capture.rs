@@ -30,9 +30,7 @@ use crate::units;
 pub struct Capture {
     pub name: String,
     pub logical: (i32, i32),
-    /// The output's transform; `image` has already been put right by it.
-    pub transform: Transform,
-    /// In the output's logical orientation, at the output's scale.
+    /// In the output's logical orientation (the output's transform already undone), at the output's scale.
     pub image: Image,
 }
 
@@ -155,7 +153,6 @@ pub fn capture_all(conn: &Connection) -> Result<Vec<Capture>, String> {
         captures.push(Capture {
             name: frame.name,
             logical: frame.logical,
-            transform: frame.transform,
             image: image.oriented(frame.transform, frame.y_invert),
         });
     }

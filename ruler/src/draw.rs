@@ -103,58 +103,86 @@ impl<'a> Canvas<'a> {
     }
 }
 
-/// An axis-aligned accent line `px` thick with a `px` outline on both sides.
-fn line(canvas: &mut Canvas, from: (i32, i32), to: (i32, i32), px: i32) -> Rect {
-    let x = from.0.min(to.0);
-    let y = from.1.min(to.1);
-    let core = Rect {
-        x,
-        y,
-        w: (from.0 - to.0).abs() + px,
-        h: (from.1 - to.1).abs() + px,
-    };
-    let outline = Rect {
-        x: core.x - px,
-        y: core.y - px,
-        w: core.w + 2 * px,
-        h: core.h + 2 * px,
-    };
-    canvas.fill(outline, OUTLINE);
-    canvas.fill(core, ACCENT);
-    outline
+/// The guides for one frame: axis-aligned accent lines `px` thick, each with a `px` outline.
+///
+/// Lines are collected first and painted together, every outline before any core, so where two
+/// lines meet (the crosshair's centre, the box's corners, the spacing ticks) no outline darkens
+/// an accent drawn earlier.
+pub struct Guides {
+    px: i32,
+    cores: Vec<Rect>,
 }
 
-/// A small cross centred on the measured pixel, standing in for the hidden system cursor.
-pub fn crosshair(canvas: &mut Canvas, at: (i32, i32), px: i32) -> Rect {
-    let arm = 8 * px;
-    let horizontal = line(canvas, (at.0 - arm, at.1), (at.0 + arm, at.1), px);
-    let vertical = line(canvas, (at.0, at.1 - arm), (at.0, at.1 + arm), px);
-    horizontal.union(vertical)
-}
+impl Guides {
+    pub fn new(px: i32) -> Guides {
+        Guides { px, cores: Vec::new() }
+    }
 
-#[allow(clippy::cast_possible_wrap, reason = "output sizes are far below i32::MAX")]
-pub fn spacing_guides(canvas: &mut Canvas, bounds: Bounds, at: (i32, i32), px: i32) -> Rect {
-    let (x0, y0, x1, y1) = (bounds.x0 as i32, bounds.y0 as i32, bounds.x1 as i32, bounds.y1 as i32);
-    let tick = 4 * px;
-    let mut touched = line(canvas, (x0, at.1), (x1, at.1), px);
-    touched = touched.union(line(canvas, (at.0, y0), (at.0, y1), px));
-    touched = touched.union(line(canvas, (x0, at.1 - tick), (x0, at.1 + tick), px));
-    touched = touched.union(line(canvas, (x1, at.1 - tick), (x1, at.1 + tick), px));
-    touched = touched.union(line(canvas, (at.0 - tick, y0), (at.0 + tick, y0), px));
-    touched.union(line(canvas, (at.0 - tick, y1), (at.0 + tick, y1), px))
-}
+    fn line(&mut self, from: (i32, i32), to: (i32, i32)) {
+        self.cores.push(Rect {
+            x: from.0.min(to.0),
+            y: from.1.min(to.1),
+            w: (from.0 - to.0).abs() + self.px,
+            h: (from.1 - to.1).abs() + self.px,
+        });
+    }
 
-/// The box's outline, drawn just outside it so its edge pixels stay visible.
-#[allow(clippy::cast_possible_wrap, reason = "output sizes are far below i32::MAX")]
-pub fn box_guides(canvas: &mut Canvas, bounds: Bounds, px: i32) -> Rect {
-    let left = bounds.x0 as i32 - 2 * px;
-    let top = bounds.y0 as i32 - 2 * px;
-    let right = bounds.x1 as i32 + 1 + px;
-    let bottom = bounds.y1 as i32 + 1 + px;
-    let mut touched = line(canvas, (left, top), (right, top), px);
-    touched = touched.union(line(canvas, (left, bottom), (right, bottom), px));
-    touched = touched.union(line(canvas, (left, top), (left, bottom), px));
-    touched.union(line(canvas, (right, top), (right, bottom), px))
+    fn outline(&self, core: Rect) -> Rect {
+        Rect {
+            x: core.x - self.px,
+            y: core.y - self.px,
+            w: core.w + 2 * self.px,
+            h: core.h + 2 * self.px,
+        }
+    }
+
+    /// A small cross centred on the measured pixel, standing in for the hidden system cursor.
+    pub fn crosshair(&mut self, at: (i32, i32)) {
+        let arm = 8 * self.px;
+        self.line((at.0 - arm, at.1), (at.0 + arm, at.1));
+        self.line((at.0, at.1 - arm), (at.0, at.1 + arm));
+    }
+
+    #[allow(clippy::cast_possible_wrap, reason = "output sizes are far below i32::MAX")]
+    pub fn spacing(&mut self, bounds: Bounds, at: (i32, i32)) {
+        let (x0, y0, x1, y1) = (bounds.x0 as i32, bounds.y0 as i32, bounds.x1 as i32, bounds.y1 as i32);
+        let tick = 4 * self.px;
+        self.line((x0, at.1), (x1, at.1));
+        self.line((at.0, y0), (at.0, y1));
+        self.line((x0, at.1 - tick), (x0, at.1 + tick));
+        self.line((x1, at.1 - tick), (x1, at.1 + tick));
+        self.line((at.0 - tick, y0), (at.0 + tick, y0));
+        self.line((at.0 - tick, y1), (at.0 + tick, y1));
+    }
+
+    /// The box's outline, drawn just outside it so its edge pixels stay visible.
+    #[allow(clippy::cast_possible_wrap, reason = "output sizes are far below i32::MAX")]
+    pub fn boxed(&mut self, bounds: Bounds) {
+        let px = self.px;
+        let left = bounds.x0 as i32 - 2 * px;
+        let top = bounds.y0 as i32 - 2 * px;
+        let right = bounds.x1 as i32 + 1 + px;
+        let bottom = bounds.y1 as i32 + 1 + px;
+        self.line((left, top), (right, top));
+        self.line((left, bottom), (right, bottom));
+        self.line((left, top), (left, bottom));
+        self.line((right, top), (right, bottom));
+    }
+
+    /// Paints every line; returns the rectangle covering them all, outlines included (not
+    /// clipped to the canvas, which is harmless for damage), or `None` if there were none.
+    pub fn paint(&self, canvas: &mut Canvas) -> Option<Rect> {
+        let mut touched: Option<Rect> = None;
+        for &core in &self.cores {
+            let outline = self.outline(core);
+            canvas.fill(outline, OUTLINE);
+            touched = Some(touched.map_or(outline, |t| t.union(outline)));
+        }
+        for &core in &self.cores {
+            canvas.fill(core, ACCENT);
+        }
+        touched
+    }
 }
 
 /// Moves a label of `size` from `preferred` just enough to stay inside `area`.
@@ -225,7 +253,9 @@ mod tests {
     fn the_box_outline_leaves_the_measured_pixels_alone() {
         let mut data = canvas_data(30, 30);
         let bounds = Bounds { x0: 10, y0: 10, x1: 19, y1: 19 };
-        let touched = box_guides(&mut Canvas::new(&mut data, 30, 30, 120), bounds, 1);
+        let mut guides = Guides::new(1);
+        guides.boxed(bounds);
+        let touched = guides.paint(&mut Canvas::new(&mut data, 30, 30, 120)).unwrap();
         for (x, y) in [(10, 10), (19, 19), (10, 19), (19, 10), (15, 15)] {
             assert_eq!(pixel(&data, 30, x, y), [255, 255, 255], "({x},{y}) was painted");
         }
@@ -238,11 +268,34 @@ mod tests {
     fn spacing_guides_cover_the_gap_and_report_it() {
         let mut data = canvas_data(30, 30);
         let bounds = Bounds { x0: 5, y0: 8, x1: 24, y1: 20 };
-        let touched = spacing_guides(&mut Canvas::new(&mut data, 30, 30, 120), bounds, (12, 14), 1);
+        let mut guides = Guides::new(1);
+        guides.spacing(bounds, (12, 14));
+        let touched = guides.paint(&mut Canvas::new(&mut data, 30, 30, 120)).unwrap();
         assert_ne!(pixel(&data, 30, 5, 14), [255, 255, 255], "the row line reaches x0");
         assert_ne!(pixel(&data, 30, 12, 20), [255, 255, 255], "the column line reaches y1");
         assert!(touched.x <= 5 && touched.x + touched.w >= 25);
         assert!(touched.y <= 8 && touched.y + touched.h >= 21);
+    }
+
+    #[test]
+    fn crossing_lines_keep_their_accent() {
+        let mut data = canvas_data(30, 30);
+        let mut guides = Guides::new(1);
+        guides.crosshair((15, 15));
+        guides.boxed(Bounds { x0: 5, y0: 5, x1: 24, y1: 24 });
+        guides.paint(&mut Canvas::new(&mut data, 30, 30, 120));
+        let accent = [ACCENT[0], ACCENT[1], ACCENT[2]];
+        // Each of these is on one line's core and under a later line's outline.
+        assert_eq!(pixel(&data, 30, 14, 15), accent, "beside the crosshair's centre");
+        assert_eq!(pixel(&data, 30, 25, 3), accent, "the box's top-right corner");
+        assert_eq!(pixel(&data, 30, 4, 26), accent, "the box's bottom-left corner");
+    }
+
+    #[test]
+    fn nothing_to_paint_touches_nothing() {
+        let mut data = canvas_data(4, 4);
+        assert_eq!(Guides::new(1).paint(&mut Canvas::new(&mut data, 4, 4, 16)), None);
+        assert!(data.iter().all(|&b| b == 255));
     }
 
     #[test]

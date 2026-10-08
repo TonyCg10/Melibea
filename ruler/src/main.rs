@@ -2,15 +2,13 @@
 //!
 //! See `docs/superpowers/specs/2026-10-08-melibea-ruler-design.md`.
 
-#![allow(dead_code)]
-// Task 7 removes this allow once every module has its caller.
-
 mod capture;
 mod cli;
 mod draw;
 mod edges;
 mod image;
 mod lock;
+mod overlay;
 mod text;
 mod units;
 
@@ -35,11 +33,63 @@ fn main() -> ExitCode {
             output,
             tolerance,
         } => headless(mode, at, &output, tolerance),
-        Command::Interactive { .. } => {
-            eprintln!("melibea-ruler: the interactive ruler arrives in the next task");
-            ExitCode::FAILURE
-        }
+        Command::Interactive { tolerance } => interactive(tolerance),
     }
+}
+
+/// Freezes the screen, lets one thing be measured, copies it, and exits.
+fn interactive(tolerance: u8) -> ExitCode {
+    let _lock = match lock::acquire() {
+        Ok(Some(lock)) => lock,
+        // Another ruler is open: a second one would capture its guides.
+        Ok(None) => return ExitCode::SUCCESS,
+        Err(message) => return fail(&message),
+    };
+    let conn = match Connection::connect_to_env() {
+        Ok(conn) => conn,
+        Err(e) => return fail(&format!("cannot connect to the compositor: {e}")),
+    };
+    // Everything that can fail before anything is shown, fails here.
+    let captures = match capture::capture_all(&conn) {
+        Ok(captures) => captures,
+        Err(message) => return fail(&message),
+    };
+    let text = match text::Text::load() {
+        Ok(text) => text,
+        Err(message) => return fail(&message),
+    };
+    match overlay::run(&conn, captures, tolerance, text) {
+        overlay::Outcome::Copy(result) => copy(&result),
+        overlay::Outcome::Cancel => ExitCode::SUCCESS,
+        overlay::Outcome::Fail(message) => fail(&message),
+    }
+}
+
+fn copy(result: &str) -> ExitCode {
+    use std::io::Write as _;
+    let spawned = std::process::Command::new("wl-copy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(result.as_bytes())?;
+            }
+            child.wait()
+        });
+    match spawned {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => fail(&format!("wl-copy exited with {status}; {result} was not copied")),
+        Err(e) => fail(&format!("cannot run wl-copy ({e}); {result} was not copied")),
+    }
+}
+
+/// A failure launched from a bind is otherwise invisible, so it is also notified.
+fn fail(message: &str) -> ExitCode {
+    eprintln!("melibea-ruler: {message}");
+    let _ = std::process::Command::new("notify-send")
+        .args(["Regla", message])
+        .status();
+    ExitCode::FAILURE
 }
 
 /// Measures at one point, prints the result and exits, showing nothing.
