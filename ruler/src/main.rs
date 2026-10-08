@@ -9,6 +9,7 @@ mod cli;
 mod draw;
 mod edges;
 mod image;
+mod lock;
 mod text;
 mod units;
 
