@@ -1,0 +1,21 @@
+[package]
+name = "melibea-ruler"
+version = "0.1.0"
+edition = "2024"
+description = "One-shot screen ruler for niri: element bounds and spacing in logical pixels"
+license = "MIT"
+publish = false
+
+[dependencies]
+ab_glyph = "0.2.32"
+smithay-client-toolkit = { version = "0.19.2", default-features = false, features = ["xkbcommon"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
