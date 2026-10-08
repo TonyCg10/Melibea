@@ -36,6 +36,7 @@ use crate::capture::Capture;
 use crate::cli::Mode;
 use crate::draw::{self, Canvas, Guides, Rect};
 use crate::edges::{self, Bounds, Region};
+use crate::image::Image;
 use crate::text::{self, Label, Text};
 use crate::units;
 
@@ -324,7 +325,7 @@ impl Overlay {
         let (buffer, canvas) = pool
             .create_buffer(width, height, stride, wl_shm::Format::Xrgb8888)
             .map_err(|e| format!("cannot allocate a frame for {}: {e}", surface.capture.name))?;
-        canvas.copy_from_slice(&image.data()[..canvas.len()]);
+        copy_frame(canvas, image);
 
         let mut drawn = None;
         if let Some((at, bounds)) = measured {
@@ -391,6 +392,16 @@ impl Overlay {
             self.outcome = Some(outcome);
         }
     }
+}
+
+/// Copies the frozen frame into the start of a buffer's canvas.
+///
+/// The canvas is the whole `SlotPool` slot, which is the frame's `stride × height` rounded up
+/// to a multiple of 64 bytes, so it is often longer than the frame. Exactly the frame's bytes
+/// are copied; the tail past them is never shown.
+fn copy_frame(canvas: &mut [u8], image: &Image) {
+    let len = image.stride() as usize * image.height() as usize;
+    canvas[..len].copy_from_slice(&image.data()[..len]);
 }
 
 impl LayerShellHandler for Overlay {
@@ -699,3 +710,35 @@ delegate_pointer!(Overlay);
 delegate_layer!(Overlay);
 delegate_registry!(Overlay);
 delegate_simple!(Overlay, WpViewporter, 1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_frame_is_copied_into_a_longer_canvas() {
+        // 942 × 4 = 3768 bytes a row, as in the nest: 3 rows are 11304 bytes, and the slot
+        // rounds that up to 11328.
+        let image = Image::from_rgb(942, 3, |x, y| [u8::try_from((x + y) % 256).unwrap(), 7, 9]);
+        let len = image.data().len();
+        let mut canvas = vec![0xAB; len.next_multiple_of(64)];
+        assert!(canvas.len() > len);
+        copy_frame(&mut canvas, &image);
+        assert_eq!(&canvas[..len], image.data());
+        assert!(
+            canvas[len..].iter().all(|&b| b == 0xAB),
+            "the tail is left alone"
+        );
+    }
+
+    #[test]
+    fn only_the_frame_is_copied_from_longer_image_data() {
+        let mut data = vec![1u8; 2 * 4 * 2];
+        data.extend([2u8; 16]);
+        let image = Image::new(2, 2, 8, data);
+        let mut canvas = vec![0u8; 64];
+        copy_frame(&mut canvas, &image);
+        assert!(canvas[..16].iter().all(|&b| b == 1));
+        assert!(canvas[16..].iter().all(|&b| b == 0));
+    }
+}
