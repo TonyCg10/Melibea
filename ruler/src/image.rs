@@ -86,6 +86,10 @@ pub enum Transform {
 }
 
 impl Image {
+    /// The reference convention is niri's (and smithay's): a logical-orientation point reaches the
+    /// buffer through `output_transform.invert().transform_point_in(..)`, and `invert()` swaps
+    /// `Flipped90` with `Flipped270`. The protocol text alone reads the other way round.
+    ///
     /// Puts a capture into the output's logical orientation: undoes `y_invert` first (the
     /// capture is bottom-up when set), then the inverse of the output transform. A quarter turn
     /// swaps the width and the height.
@@ -111,9 +115,9 @@ impl Image {
                 Transform::Rotated180 => (pw - 1 - x, ph - 1 - y),
                 Transform::Rotated270 => (pw - 1 - y, x),
                 Transform::Flipped => (pw - 1 - x, y),
-                Transform::Flipped90 => (y, x),
+                Transform::Flipped90 => (pw - 1 - y, ph - 1 - x),
                 Transform::Flipped180 => (x, ph - 1 - y),
-                Transform::Flipped270 => (pw - 1 - y, ph - 1 - x),
+                Transform::Flipped270 => (y, x),
             };
             self.rgb(sx, sy)
         })
@@ -223,17 +227,17 @@ mod tests {
     }
 
     #[test]
-    fn flipped_90_is_a_transpose() {
+    fn flipped_90_is_the_anti_transpose() {
         let image = numbered().oriented(Transform::Flipped90, false);
         assert_eq!((image.width(), image.height()), (2, 3));
-        assert_eq!(rows(&image), [[0, 10], [1, 11], [2, 12]]);
+        assert_eq!(rows(&image), [[12, 2], [11, 1], [10, 0]]);
     }
 
     #[test]
-    fn flipped_270_is_the_other_diagonal() {
+    fn flipped_270_is_the_transpose() {
         let image = numbered().oriented(Transform::Flipped270, false);
         assert_eq!((image.width(), image.height()), (2, 3));
-        assert_eq!(rows(&image), [[12, 2], [11, 1], [10, 0]]);
+        assert_eq!(rows(&image), [[0, 10], [1, 11], [2, 12]]);
     }
 
     #[test]
