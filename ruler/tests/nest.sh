@@ -25,6 +25,10 @@ layout {
     default-column-width { proportion 1.0; }
 }
 prefer-no-csd
+// The startup hotkey overlay would cover the probe box and be measured instead of it.
+hotkey-overlay {
+    skip-at-startup
+}
 EOK
 niri validate -c "$work/niri.kdl" > /dev/null 2>&1
 
