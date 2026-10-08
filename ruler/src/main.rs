@@ -2,7 +2,12 @@
 //!
 //! See `docs/superpowers/specs/2026-10-08-melibea-ruler-design.md`.
 
+#![allow(dead_code)]
+// Task 7 removes this allow once every module has its caller.
+
 mod cli;
+mod image;
+mod units;
 
 use std::process::ExitCode;
 

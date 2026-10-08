@@ -18,7 +18,6 @@ pub enum Mode {
 }
 
 impl Mode {
-    #[allow(dead_code)]
     pub fn toggled(self) -> Mode {
         match self {
             Mode::Box => Mode::Spacing,
@@ -26,7 +25,6 @@ impl Mode {
         }
     }
 
-    #[allow(dead_code)]
     pub fn name(self) -> &'static str {
         match self {
             Mode::Box => "box",
