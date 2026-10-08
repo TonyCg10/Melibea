@@ -6,11 +6,18 @@ use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 
 use crate::draw::{Canvas, LABEL_BG, LABEL_DIM, LABEL_FG, Rect, Rgba};
 
-/// Logical sizes; multiplied by `px` for each output.
-const MAIN_SIZE: i32 = 13;
-const DETAIL_SIZE: i32 = 10;
-const PADDING: i32 = 6;
-const GAP: i32 = 2;
+/// Logical sizes; multiplied by the output's real (fractional) scale, so the label is the same
+/// logical size on every output.
+const MAIN_SIZE: f32 = 13.0;
+const DETAIL_SIZE: f32 = 10.0;
+const PADDING: f32 = 6.0;
+const GAP: f32 = 2.0;
+
+/// A logical length in physical pixels, rounded.
+#[allow(clippy::cast_possible_truncation, reason = "lengths are small")]
+fn physical(logical: f32, scale: f32) -> i32 {
+    (logical * scale).round() as i32
+}
 
 pub struct Text {
     font: FontVec,
@@ -80,25 +87,28 @@ impl Text {
     }
 }
 
-#[allow(clippy::cast_precision_loss, reason = "font sizes are small integers")]
-pub fn label_size(text: &Text, label: &Label, px: i32) -> (i32, i32) {
-    let main = text.line_size(label.main, (MAIN_SIZE * px) as f32);
-    let detail = text.line_size(label.detail, (DETAIL_SIZE * px) as f32);
+#[allow(clippy::cast_possible_truncation, reason = "scales are small")]
+pub fn label_size(text: &Text, label: &Label, scale: f64) -> (i32, i32) {
+    let scale = scale as f32;
+    let main = text.line_size(label.main, MAIN_SIZE * scale);
+    let detail = text.line_size(label.detail, DETAIL_SIZE * scale);
+    let (padding, gap) = (physical(PADDING, scale), physical(GAP, scale));
     (
-        main.0.max(detail.0) + 2 * PADDING * px,
-        main.1 + GAP * px + detail.1 + 2 * PADDING * px,
+        main.0.max(detail.0) + 2 * padding,
+        main.1 + gap + detail.1 + 2 * padding,
     )
 }
 
-#[allow(clippy::cast_precision_loss, reason = "font sizes are small integers")]
+#[allow(clippy::cast_possible_truncation, reason = "scales are small")]
 pub fn draw_label(
     text: &Text,
     canvas: &mut Canvas,
     label: &Label,
     at: (i32, i32),
-    px: i32,
+    scale: f64,
 ) -> Rect {
-    let (w, h) = label_size(text, label, px);
+    let (w, h) = label_size(text, label, scale);
+    let scale = scale as f32;
     let background = Rect {
         x: at.0,
         y: at.1,
@@ -107,15 +117,16 @@ pub fn draw_label(
     };
     canvas.fill(background, LABEL_BG);
 
-    let main_size = (MAIN_SIZE * px) as f32;
+    let main_size = MAIN_SIZE * scale;
     let main_height = text.line_size(label.main, main_size).1;
-    let inner = (at.0 + PADDING * px, at.1 + PADDING * px);
+    let (padding, gap) = (physical(PADDING, scale), physical(GAP, scale));
+    let inner = (at.0 + padding, at.1 + padding);
     text.draw_line(canvas, label.main, inner, main_size, LABEL_FG);
     text.draw_line(
         canvas,
         label.detail,
-        (inner.0, inner.1 + main_height + GAP * px),
-        (DETAIL_SIZE * px) as f32,
+        (inner.0, inner.1 + main_height + gap),
+        DETAIL_SIZE * scale,
         LABEL_DIM,
     );
     background
@@ -135,7 +146,7 @@ mod tests {
                 main: "1 × 1",
                 detail: "box",
             },
-            1,
+            1.0,
         );
         let long = label_size(
             &text,
@@ -143,10 +154,30 @@ mod tests {
                 main: "1234 × 5678",
                 detail: "box",
             },
-            1,
+            1.0,
         );
         assert!(long.0 > short.0);
         assert!(short.1 > 0);
+    }
+
+    #[test]
+    fn the_label_is_the_same_logical_size_at_scale_one_and_a_half() {
+        let text = Text::load().expect("a monospace font via fc-match");
+        // A monospace line is about 1.0 to 1.4 em tall, so 13 px gives 13..=18, and the
+        // same line at scale 1.5 is 19.5 px of font, about 1.5 times as tall (ceilings
+        // may add a pixel or two).
+        let one = text.line_size("412 × 38", MAIN_SIZE).1;
+        let one_and_a_half = text.line_size("412 × 38", MAIN_SIZE * 1.5).1;
+        assert!((13..=18).contains(&one), "{one}");
+        assert!(
+            (one_and_a_half - one * 3 / 2).abs() <= 2,
+            "{one_and_a_half} is not about 1.5 x {one}"
+        );
+        let label = Label {
+            main: "412 × 38",
+            detail: "box",
+        };
+        assert!(label_size(&text, &label, 1.5).1 > label_size(&text, &label, 1.0).1);
     }
 
     #[test]
@@ -163,7 +194,7 @@ mod tests {
             &mut Canvas::new(&mut data, width, height, width * 4),
             &label,
             (10, 10),
-            1,
+            1.0,
         );
         for y in 0..height {
             for x in 0..width {

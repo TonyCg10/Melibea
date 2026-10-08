@@ -348,6 +348,77 @@ mod tests {
     }
 
     #[test]
+    fn the_box_outline_at_double_thickness_stays_outside_the_box() {
+        // px = 2 is the scale-1.5 case. The box covers x and y 20..=39. The left line's core
+        // is x 16..=17 (left = 20 - 2*2) with its outline x 14..=19; the right line's core
+        // is x 42..=43 (right = 39 + 1 + 2) with its outline x 40..=45; the top and bottom
+        // lines mirror them in y (cores 16..=17 and 42..=43).
+        let mut data = canvas_data(60, 60);
+        let bounds = Bounds {
+            x0: 20,
+            y0: 20,
+            x1: 39,
+            y1: 39,
+        };
+        let mut guides = Guides::new(2);
+        guides.boxed(bounds);
+        guides
+            .paint(&mut Canvas::new(&mut data, 60, 60, 240))
+            .unwrap();
+        for (x, y) in [
+            (20, 20),
+            (39, 39),
+            (20, 39),
+            (39, 20),
+            (30, 30),
+            (20, 25),
+            (39, 25),
+            (25, 20),
+            (25, 39),
+        ] {
+            assert_eq!(
+                pixel(&data, 60, x, y),
+                [255, 255, 255],
+                "({x},{y}) was painted"
+            );
+        }
+        for (x, y) in [(19, 25), (40, 25), (25, 19), (25, 40), (16, 16), (43, 43)] {
+            assert_ne!(
+                pixel(&data, 60, x, y),
+                [255, 255, 255],
+                "({x},{y}) was not painted"
+            );
+        }
+    }
+
+    #[test]
+    fn spacing_guides_reach_the_bounds_at_double_thickness() {
+        // px = 2. The row line runs from x0 = 10 to x1 = 49 and is 39 + 2 = 41 wide, so its
+        // core is x 10..=50 at y 28..=29; the column line likewise covers y 16..=41 at x 30..=31.
+        let mut data = canvas_data(60, 60);
+        let bounds = Bounds {
+            x0: 10,
+            y0: 16,
+            x1: 49,
+            y1: 40,
+        };
+        let mut guides = Guides::new(2);
+        guides.spacing(bounds, (30, 28));
+        let touched = guides
+            .paint(&mut Canvas::new(&mut data, 60, 60, 240))
+            .unwrap();
+        for (x, y) in [(10, 28), (49, 28), (30, 16), (30, 40)] {
+            assert_ne!(
+                pixel(&data, 60, x, y),
+                [255, 255, 255],
+                "({x},{y}) was not painted"
+            );
+        }
+        assert!(touched.x <= 10 && touched.x + touched.w >= 51);
+        assert!(touched.y <= 16 && touched.y + touched.h >= 42);
+    }
+
+    #[test]
     fn spacing_guides_cover_the_gap_and_report_it() {
         let mut data = canvas_data(30, 30);
         let bounds = Bounds {

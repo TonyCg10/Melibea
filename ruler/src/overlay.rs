@@ -353,7 +353,7 @@ impl Overlay {
                 main: &main,
                 detail: &detail,
             };
-            let size = text::label_size(text, &label, px);
+            let size = text::label_size(text, &label, scale);
             let preferred = match mode {
                 Mode::Box => (
                     bounds.x0 as i32 - px,
@@ -362,7 +362,7 @@ impl Overlay {
                 Mode::Spacing => (at_i.0 + 12 * px, at_i.1 + 12 * px),
             };
             let place = draw::place_label(size, preferred, c.size());
-            let label_rect = text::draw_label(text, &mut c, &label, place, px);
+            let label_rect = text::draw_label(text, &mut c, &label, place, scale);
             drawn = Some(lines.map_or(label_rect, |l| l.union(label_rect)));
         }
 
@@ -520,9 +520,11 @@ impl PointerHandler for Overlay {
                 PointerEventKind::Press {
                     button: BTN_RIGHT, ..
                 } => self.finish(Outcome::Cancel),
-                PointerEventKind::Axis { vertical, .. } if vertical.absolute != 0.0 => {
-                    // Wheel up widens the tolerance, wheel down narrows it.
-                    let tolerance = if vertical.absolute < 0.0 {
+                PointerEventKind::Axis { vertical, .. } if vertical.discrete != 0 => {
+                    // One step per notch: a high-resolution wheel sends several axis events
+                    // per notch, but only one carries a discrete step. Wheel up widens the
+                    // tolerance, wheel down narrows it.
+                    let tolerance = if vertical.discrete < 0 {
                         self.tolerance.saturating_add(TOLERANCE_STEP)
                     } else {
                         self.tolerance.saturating_sub(TOLERANCE_STEP)

@@ -740,8 +740,11 @@ Met in a nested niri: a known-size 300x200 box measured exactly at scales 1 and
 `melibea.service`; the single-instance lock; Escape; and the frozen picture
 shown unchanged. Awaiting the person's check: a GTK button's bounds from a
 point inside it, the pointer-driven behaviour (crosshair, labels, wheel,
-click-to-copy), and one measurement on each of the three real outputs (mixed DPI
-and refresh rate). Horizontal-only and vertical-only measurements were dropped
+click-to-copy), one measurement on each of the three real outputs (mixed DPI
+and refresh rate), and that pointer motion on DP-1 (3840×2160, scale 1.5,
+165 Hz) feels smooth. Every redraw copies the whole frozen frame, and that copy
+was never measured on that output; if it lags, the fallback is two buffers per
+surface, restoring only the previous guides' rectangle. Horizontal-only and vertical-only measurements were dropped
 from scope during design.
 
 **Estimated effort:** one to two focused sessions after M9
@@ -768,10 +771,12 @@ rendering stack it never uses.
 
 ### In
 
-- A layer-shell overlay that measures between two points in logical pixels.
+- A layer-shell overlay that measures between two points in logical pixels
+  (dropped during design: it measures one point's surrounding box or gap).
 - Edge detection by colour difference, with an adjustable tolerance, so a
   bounding box can be found from one point inside it.
-- Bounding-box, horizontal-only, and vertical-only measurements.
+- Bounding-box, horizontal-only, and vertical-only measurements (horizontal-only
+  and vertical-only were dropped during design).
 - Copying a measurement to the clipboard.
 - Per-output correctness on mixed-DPI outputs, reporting logical pixels and
   naming the output.

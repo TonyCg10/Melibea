@@ -3,7 +3,7 @@
 Roadmap milestone: **M10 — Screen ruler as a companion binary**
 ([ROADMAP.md](../../../ROADMAP.md#m10--screen-ruler-as-a-companion-binary)).
 
-Status: design approved 2026-10-08, not yet implemented.
+Status: implemented 2026-10-08, awaiting the person's real-session check.
 
 ## Purpose
 
@@ -34,7 +34,7 @@ needs is permissive:
 | Crate | Licence | Use |
 |---|---|---|
 | `smithay-client-toolkit` | MIT | Wayland client, layer-shell, seat, shm |
-| `wayland-client`, `wayland-protocols`, `wayland-protocols-wlr` | MIT | `wlr-screencopy`, viewporter, fractional scale |
+| `wayland-client`, `wayland-protocols`, `wayland-protocols-wlr` | MIT | `wlr-screencopy`, viewporter |
 | `ab_glyph` | Apache-2.0 | rasterising the label text |
 
 `ab_glyph` and its dependencies `ab_glyph_rasterizer` and `owned_ttf_parser` are
@@ -93,7 +93,7 @@ The root `Cargo.toml` becomes a workspace with two packages:
 |---|---|---|
 | `capture` | Capture each output once through `wlr-screencopy` into an in-memory image. The only code that speaks the capture protocol. | Wayland |
 | `edges` | Given an image and a point, find edges: box and spacing. Pure functions. | nothing |
-| `overlay` | Layer surfaces, pointer and keyboard, drawing the frozen picture and the guides. | Wayland, `tiny-skia`, `ab_glyph` |
+| `overlay` | Layer surfaces, pointer and keyboard, drawing the frozen picture and the guides. | Wayland, `ab_glyph` |
 | `main` | Argument parsing, the single-instance lock, wiring, exit. | all of the above |
 
 `edges` takes an image type of its own (width, height, stride, pixels) rather
@@ -111,8 +111,9 @@ than a Wayland buffer, so it is tested without a compositor.
 3. **Show.** Create one layer surface per output on the `overlay` layer,
    anchored to all four edges, exclusive zone `-1`, keyboard interactivity
    `exclusive`. Each shows its own capture at native resolution: the buffer is
-   the physical size of the capture, presented through viewporter and
-   fractional scale, so DP-1 shows its real 3840×2160 pixels.
+   the physical size of the capture, and a viewport destination sets the
+   logical size, which presents it 1:1, so DP-1 shows its real 3840×2160 pixels.
+   No fractional-scale protocol is bound.
 4. **Measure.** On pointer motion, recompute and redraw only on the output
    under the pointer.
 5. **Finish.**
@@ -121,8 +122,8 @@ than a Wayland buffer, so it is tested without a compositor.
    - **Wheel**: raise or lower the tolerance.
    - **Escape or right click**: exit without copying.
 
-It is launched from a bind in the `tools` binding mode (for example `R`). It
-does not use `melibea.service` or any shell.
+It is launched from a bind in the `tools` binding mode (for example Mod+H,
+then `M`). It does not use `melibea.service` or any shell.
 
 ## Edge detection
 
@@ -223,9 +224,13 @@ No error leaves an overlay on screen or the keyboard grabbed.
 
 ## Performance
 
-Each output's capture is kept once in memory. On pointer motion only the
-damaged area is redrawn — the old guides and label, and the new ones — rather
-than the 33 MB of a 4K frame.
+Each output's capture is kept once in memory. Every redraw copies the whole
+frozen frame into a fresh shm buffer, draws the guides and label on the copy,
+and damages only the changed area (the old guides and label, and the new
+ones), so the compositor uploads only that. Redraws are paced by frame
+callbacks. The full-frame copy (33 MB at 4K) was not measured on DP-1; if that
+output lags, the fallback is two buffers per surface, restoring only the
+previous guides' rectangle.
 
 ## Headless mode
 

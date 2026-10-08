@@ -40,7 +40,7 @@ cargo run -- minimize [WINDOW_ID]
 cargo run -- restore WINDOW_ID
 cargo run -- close WINDOW_ID
 cargo run -- subscribe
-cargo test
+cargo test --workspace
 ```
 
 `check-config` performs strict parsing and validation without contacting niri
@@ -85,9 +85,10 @@ scripts/install.sh
 ```
 
 It builds the workspace in release, installs `~/.local/bin/melibea` and
-`~/.local/bin/melibea-ruler` (or under `$MELIBEA_PREFIX/bin`) by an atomic rename, checks the installed bytes
-against the build, and then removes `target/`, which nothing reads after the
-install and the next build regenerates. `--keep-target` leaves it. A running
+`~/.local/bin/melibea-ruler` (or under `$MELIBEA_PREFIX/bin`) by an atomic
+rename, checks the installed bytes against the build, and then removes
+`target/`, which nothing reads after the install and the next build
+regenerates. `--keep-target` leaves it. A running
 daemon keeps the previous binary until it restarts.
 
 The repository includes [`contrib/systemd/melibea.service`](contrib/systemd/melibea.service).
