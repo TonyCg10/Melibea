@@ -3,8 +3,9 @@ set -eu
 
 # install.sh — build Melibea in release, install it, then drop the build tree.
 #
-# The binary goes to $MELIBEA_PREFIX/bin/melibea (default ~/.local), the path
-# contrib/systemd/melibea.service runs. It is copied to a temporary file and
+# Two binaries are installed, melibea and melibea-ruler, into
+# $MELIBEA_PREFIX/bin (default ~/.local); melibea is the path
+# contrib/systemd/melibea.service runs. Each is copied to a temporary file and
 # renamed over the old one, so a running daemon keeps its open binary and picks
 # up the new one at its next restart; this script never restarts it.
 #
@@ -27,22 +28,24 @@ esac
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 prefix=${MELIBEA_PREFIX:-$HOME/.local}
-destination=$prefix/bin/melibea
 
-(cd "$repo_root" && cargo build --release --locked)
-built=$repo_root/target/release/melibea
+(cd "$repo_root" && cargo build --release --locked --workspace)
 
 mkdir -p -- "$prefix/bin"
-temporary=$(mktemp "$prefix/bin/.melibea.XXXXXX")
-trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
-install -m 0755 "$built" "$temporary"
-mv -f -- "$temporary" "$destination"
-trap - EXIT HUP INT TERM
-cmp -s -- "$built" "$destination" || {
-    echo "install: $destination does not match $built" >&2
-    exit 1
-}
-echo ">> installed $destination" >&2
+for name in melibea melibea-ruler; do
+    built=$repo_root/target/release/$name
+    destination=$prefix/bin/$name
+    temporary=$(mktemp "$prefix/bin/.$name.XXXXXX")
+    trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
+    install -m 0755 "$built" "$temporary"
+    mv -f -- "$temporary" "$destination"
+    trap - EXIT HUP INT TERM
+    cmp -s -- "$built" "$destination" || {
+        echo "install: $destination does not match $built" >&2
+        exit 1
+    }
+    echo ">> installed $destination" >&2
+done
 
 if [ "$keep_target" -eq 0 ]; then
     (cd "$repo_root" && cargo clean --quiet)

@@ -18,7 +18,7 @@ M0 Foundation (done)
       -> M7 Coordinated bubble motion (complete, one criterion deferred)
       -> M8 Optional expansions
   -> M9 Screen magnifier (complete, in the Niri fork)
-      -> M10 Screen ruler companion binary (planned)
+      -> M10 Screen ruler companion binary (built; awaiting real-session check)
   -> M11 Binding modes (complete, in the Niri fork)
 ```
 
@@ -731,7 +731,18 @@ workspace.
 
 ## M10 — Screen ruler as a companion binary
 
-**Status:** planned
+**Status:** built — `melibea-ruler`, installed by `scripts/install.sh` and bound to
+`M` in the `tools` binding mode (Mod+H, then M). Awaiting the real-session check.
+Design: [docs/superpowers/specs/2026-10-08-melibea-ruler-design.md](docs/superpowers/specs/2026-10-08-melibea-ruler-design.md).
+
+Met in a nested niri: a known-size 300x200 box measured exactly at scales 1 and
+1.5, in both box and spacing modes; the headless mode; running with no
+`melibea.service`; the single-instance lock; Escape; and the frozen picture
+shown unchanged. Awaiting the person's check: a GTK button's bounds from a
+point inside it, the pointer-driven behaviour (crosshair, labels, wheel,
+click-to-copy), and one measurement on each of the three real outputs (mixed DPI
+and refresh rate). Horizontal-only and vertical-only measurements were dropped
+from scope during design.
 
 **Estimated effort:** one to two focused sessions after M9
 

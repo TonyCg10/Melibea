@@ -84,8 +84,8 @@ Build and install the binary with:
 scripts/install.sh
 ```
 
-It builds in release, installs `~/.local/bin/melibea` (or
-`$MELIBEA_PREFIX/bin/melibea`) by an atomic rename, checks the installed bytes
+It builds the workspace in release, installs `~/.local/bin/melibea` and
+`~/.local/bin/melibea-ruler` (or under `$MELIBEA_PREFIX/bin`) by an atomic rename, checks the installed bytes
 against the build, and then removes `target/`, which nothing reads after the
 install and the next build regenerates. `--keep-target` leaves it. A running
 daemon keeps the previous binary until it restarts.
@@ -100,6 +100,24 @@ spawn-at-startup "systemctl" "--user" "restart" "melibea.service"
 The unit is deliberately not enabled on `default.target`: niri owns session
 startup so the current `NIRI_SOCKET` is available. Runtime diagnostics are
 available with `journalctl --user -u melibea.service`.
+
+## Screen ruler
+
+`melibea-ruler` is a second binary in this repository, separate from the daemon
+and independent of it. It freezes the screen, then measures on the frozen
+picture: from the pointer it finds the box of the element under it, or the gap
+it stands in, in logical pixels, and a click copies the measurement. Escape
+leaves. Run it from the `tools` binding mode, where it is bound to `M`
+(Mod+H, then M).
+
+For scripts there is a headless mode that shows nothing:
+
+```sh
+melibea-ruler --measure box|spacing --at X,Y --output NAME [--tolerance N]
+```
+
+It prints the result (for example `412x38`) and exits. See the
+[design](docs/superpowers/specs/2026-10-08-melibea-ruler-design.md).
 
 ## Current state
 

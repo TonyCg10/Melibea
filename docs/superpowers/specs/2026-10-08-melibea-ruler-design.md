@@ -35,14 +35,28 @@ needs is permissive:
 |---|---|---|
 | `smithay-client-toolkit` | MIT | Wayland client, layer-shell, seat, shm |
 | `wayland-client`, `wayland-protocols`, `wayland-protocols-wlr` | MIT | `wlr-screencopy`, viewporter, fractional scale |
-| `tiny-skia` | BSD-3-Clause | drawing lines and the label background |
-| `ab_glyph` | MIT OR Apache-2.0 | rasterising the label text |
+| `ab_glyph` | Apache-2.0 | rasterising the label text |
 
-The roadmap required this question answered before any code; it is. The niri
+`ab_glyph` and its dependencies `ab_glyph_rasterizer` and `owned_ttf_parser` are
+Apache-2.0 only, which is compatible with distributing the ruler under MIT.
+Every other transitive dependency is also permissive (MIT, Apache-2.0,
+Zlib/Apache/MIT, Unlicense/MIT, or Unicode-3.0 combinations).
+
+`tiny-skia` was dropped while planning: every line the ruler draws is horizontal or vertical
+and the label background is a plain rectangle, so a few clipped rectangle fills cover all of
+it and are tested directly.
+
+Two facts from the build are recorded here. Captures are mapped into each
+output's logical orientation, so a rotated or flipped output measures
+correctly; the flipped quarter-turns follow niri's own
+`invert().transform_*_in` convention. And capture buffers come from one shm
+pool per frame, because niri rejected capture buffers from SCTK's `SlotPool`.
+
+The roadmap required the licence question answered before any code; it is. The niri
 fork already implements `wlr-screencopy`, so the ruler needs nothing new from
 the compositor.
 
-`tiny-skia` and `ab_glyph` are not in the local cargo cache, so the first build
+`ab_glyph` is not in the local cargo cache, so the first build
 needs network access.
 
 ### Approach: freeze, then measure
