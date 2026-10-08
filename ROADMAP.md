@@ -17,9 +17,9 @@ M0 Foundation (done)
       -> M6 Celestina bubble integration (complete)
       -> M7 Coordinated bubble motion (complete, one criterion deferred)
       -> M8 Optional expansions
-  -> M9 Screen magnifier (planned, in the Niri fork)
+  -> M9 Screen magnifier (complete, in the Niri fork)
       -> M10 Screen ruler companion binary (planned)
-  -> M11 Binding modes (planned, in the Niri fork)
+  -> M11 Binding modes (complete, in the Niri fork)
 ```
 
 M9, M10 and M11 are session tools rather than surface-state work, so they sit
@@ -624,13 +624,23 @@ without the transition, since a refused envelope means nothing moved and
 resending is safe.
 
 The real session's installed Melibea and the companion Niri M7 patch were
-**not** rebuilt or redeployed in this closing session; the Niri M7 source
-copy was lost with `/tmp` per [M7-HANDOFF.md](M7-HANDOFF.md) and was never
-reconstructed. Minimize and restore work today in the real session through
-that v1 downgrade path — correctly, but without the coordinated visual
-travel this milestone was built to add. The fifth exit criterion above, "a
-nested session shows minimize ending at the bubble," was met only inside the
-harness, not in the deployed session.
+**not** rebuilt or redeployed in this closing session. At the time the Niri M7
+source copy was believed lost with `/tmp` per [M7-HANDOFF.md](M7-HANDOFF.md).
+The fifth exit criterion above, "a nested session shows minimize ending at the
+bubble," was met only inside the harness, not in the deployed session.
+
+### Correction, 2026-10-08
+
+The Niri M7 patch was never lost: it was intact in the fork's working tree and
+is committed there as `6b6ec13` ("Add native minimization, Melibea protocol v2
+motion, and animated focus rules"). That fork build is installed and is the
+compositor the session runs today, so protocol v2 is available end to end
+rather than only through the v1 downgrade. The fork now has a real remote; see
+[Where the Niri fork lives](#where-the-niri-fork-lives).
+
+What is still owed is the observation, not code: watching one minimize end at
+its bubble in the deployed session. The deferred criterion stays deferred until
+that is seen once.
 
 ## M8 — Optional expansions
 
@@ -649,7 +659,32 @@ Each candidate requires its own active milestone before implementation.
 
 ## M9 — Screen magnifier in the compositor
 
-**Status:** planned
+**Status:** complete — in the Niri fork as `3050705`, installed and in daily use
+
+### Delivered, 2026-09-06
+
+- `magnify-in`, `magnify-out` and `magnify-reset` actions, also over IPC, with
+  a `magnifier { step max animation }` configuration block.
+- Bound to the wheel and to `=`/`-`/`0` inside a `zoom` binding mode (entered
+  from `tools`), so the wheel is only taken while the mode is on.
+- Only the output under the pointer is magnified; the others are untouched.
+- Screenshots and screencasts carry the unmagnified screen.
+
+### Where it departed from the plan
+
+- **Not built on the overview zoom transform.** The output's elements are
+  rendered once into an offscreen texture and that texture is rescaled. This
+  is still a GPU transform, with no read-back to the CPU, so the "no capture
+  path" rule holds; it was simply the only way to magnify panels and cursor
+  together with windows.
+- **The view is centred on the pointer and clamped to the output** instead of
+  scaled about the pointer. Scaling about the pointer made the edges and
+  corners unreachable at high zoom, which is exactly where a magnifier gets
+  used. The cost is the exit criterion "the pointer stays under the cursor's
+  real position at every zoom level": near the edges it no longer does, by
+  design.
+- Fixing the wheel binds exposed a regression from M11 — modes reserved the
+  bare wheel for the whole session — fixed in the same commit.
 
 **Estimated effort:** one to two focused sessions
 
@@ -757,7 +792,27 @@ does not live here.
 
 ## M11 — Binding modes in the compositor
 
-**Status:** planned
+**Status:** complete — in the Niri fork as `fd3dba4` and `77f1f09`, installed
+and in daily use
+
+### Delivered, 2026-08-24 to 2026-09-06
+
+- `binding-mode` blocks with their own binds and `exit-on-action`, the
+  `enter-binding-mode` and `exit-binding-mode` actions, and an IPC event when
+  the active mode changes.
+- Escape is added to every mode that does not bind it itself, at parse time,
+  so no mode can capture the keyboard.
+- A mode deleted by a configuration reload falls back to the ordinary binds.
+- Beyond the plan: an ambient indicator drawn by the compositor — two faint
+  lights at the side edges while a mode is active — so it works with any shell
+  or none, and is left out of screenshots and screencasts.
+- After the fact, and as the separate decision the plan asked for, the live
+  configuration was regrouped into `apps`, `monitor`, `size`, `window` and
+  `tools` modes.
+- Regression found later and fixed in `3050705`: the reserved-modifier sets
+  were built from every mode at once, so a mode binding the bare wheel took
+  scrolling from every application for the whole session. They now follow
+  the active mode only, and are rebuilt on reload.
 
 **Estimated effort:** one to two focused sessions
 
@@ -817,6 +872,17 @@ not at runtime. This is an exit criterion rather than a nicety.
 - A configuration with no modes behaves exactly as it does today.
 - Reloading the configuration while inside a mode leaves the session in a
   defined state rather than in a mode that no longer exists.
+
+## Where the Niri fork lives
+
+M4, M7, M9 and M11 are code in the Niri fork, not in this repository. The fork
+is GPL-3.0, like niri, and is kept as its own repository rather than inside
+this MIT one: <https://github.com/TonyCg10/niri-melibea>, branch `main`, on
+top of upstream niri `8ed0da4`.
+
+Until 2026-09-23 its only remote was a directory under `/tmp` that had already
+been wiped, so the whole fork existed in one working tree. Its history was a
+shallow clone, completed from upstream niri before publishing on 2026-10-08.
 
 ## Global non-goals
 
