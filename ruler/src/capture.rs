@@ -87,7 +87,12 @@ pub fn capture_all(conn: &Connection) -> Result<Vec<Capture>, String> {
         .outputs()
         .filter_map(|output| {
             let info = state.output_state.info(&output)?;
-            Some((output, info.name?, info.logical_size?, transform_of(info.transform)))
+            Some((
+                output,
+                info.name?,
+                info.logical_size?,
+                transform_of(info.transform),
+            ))
         })
         .collect();
     if outputs.is_empty() {

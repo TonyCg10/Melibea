@@ -78,8 +78,12 @@ fn copy(result: &str) -> ExitCode {
         });
     match spawned {
         Ok(status) if status.success() => ExitCode::SUCCESS,
-        Ok(status) => fail(&format!("wl-copy exited with {status}; {result} was not copied")),
-        Err(e) => fail(&format!("cannot run wl-copy ({e}); {result} was not copied")),
+        Ok(status) => fail(&format!(
+            "wl-copy exited with {status}; {result} was not copied"
+        )),
+        Err(e) => fail(&format!(
+            "cannot run wl-copy ({e}); {result} was not copied"
+        )),
     }
 }
 

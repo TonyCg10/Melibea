@@ -30,7 +30,12 @@ pub fn spacing(image: &Image, x: u32, y: u32, tolerance: u8) -> Bounds {
     let reference = image.rgb(x, y);
     let same = |px: u32, py: u32| matches(image.rgb(px, py), reference, tolerance);
 
-    let mut bounds = Bounds { x0: x, y0: y, x1: x, y1: y };
+    let mut bounds = Bounds {
+        x0: x,
+        y0: y,
+        x1: x,
+        y1: y,
+    };
     while bounds.x0 > 0 && same(bounds.x0 - 1, y) {
         bounds.x0 -= 1;
     }
@@ -79,7 +84,12 @@ pub fn region(image: &Image, x: u32, y: u32, tolerance: u8) -> Region {
     let reference = image.rgb(x, y);
 
     let mut mask = vec![false; width as usize * height as usize];
-    let mut bounds = Bounds { x0: x, y0: y, x1: x, y1: y };
+    let mut bounds = Bounds {
+        x0: x,
+        y0: y,
+        x1: x,
+        y1: y,
+    };
     let mut stack = vec![(x, y)];
     mask[index(x, y)] = true;
 
@@ -137,7 +147,15 @@ mod tests {
     #[test]
     fn the_box_is_the_element_not_the_text_inside_it() {
         let region = region(&button(), 12, 6, 30);
-        assert_eq!(region.bounds(), Bounds { x0: 10, y0: 5, x1: 29, y1: 14 });
+        assert_eq!(
+            region.bounds(),
+            Bounds {
+                x0: 10,
+                y0: 5,
+                x1: 29,
+                y1: 14
+            }
+        );
         assert_eq!(region.bounds().width(), 20);
         assert_eq!(region.bounds().height(), 10);
     }
@@ -153,14 +171,30 @@ mod tests {
     #[test]
     fn a_region_reaching_the_frame_edge_stops_there() {
         let region = region(&button(), 0, 0, 30);
-        assert_eq!(region.bounds(), Bounds { x0: 0, y0: 0, x1: 39, y1: 29 });
+        assert_eq!(
+            region.bounds(),
+            Bounds {
+                x0: 0,
+                y0: 0,
+                x1: 39,
+                y1: 29
+            }
+        );
     }
 
     #[test]
     fn diagonal_neighbours_do_not_connect() {
         // A white pixel at (0,0) and one at (1,1), black elsewhere.
         let image = Image::from_rgb(2, 2, |x, y| if x == y { BG } else { [0, 0, 0] });
-        assert_eq!(region(&image, 0, 0, 0).bounds(), Bounds { x0: 0, y0: 0, x1: 0, y1: 0 });
+        assert_eq!(
+            region(&image, 0, 0, 0).bounds(),
+            Bounds {
+                x0: 0,
+                y0: 0,
+                x1: 0,
+                y1: 0
+            }
+        );
     }
 
     #[test]
@@ -186,14 +220,30 @@ mod tests {
     fn a_gradient_ends_where_it_leaves_the_tolerance() {
         // Each column one step brighter than the last.
         let image = Image::from_rgb(100, 1, |x, _| [u8::try_from(x).unwrap(); 3]);
-        assert_eq!(region(&image, 10, 0, 30).bounds(), Bounds { x0: 0, y0: 0, x1: 40, y1: 0 });
+        assert_eq!(
+            region(&image, 10, 0, 30).bounds(),
+            Bounds {
+                x0: 0,
+                y0: 0,
+                x1: 40,
+                y1: 0
+            }
+        );
     }
 
     #[test]
     fn spacing_is_the_gap_around_the_pointer() {
         // Inside the button, away from the text: row 6 spans the button, column 12 too.
         let bounds = spacing(&button(), 12, 6, 30);
-        assert_eq!(bounds, Bounds { x0: 10, y0: 5, x1: 29, y1: 14 });
+        assert_eq!(
+            bounds,
+            Bounds {
+                x0: 10,
+                y0: 5,
+                x1: 29,
+                y1: 14
+            }
+        );
     }
 
     #[test]
@@ -206,6 +256,14 @@ mod tests {
     #[test]
     fn spacing_stops_at_the_frame_edge() {
         let bounds = spacing(&button(), 2, 2, 30);
-        assert_eq!(bounds, Bounds { x0: 0, y0: 0, x1: 39, y1: 29 });
+        assert_eq!(
+            bounds,
+            Bounds {
+                x0: 0,
+                y0: 0,
+                x1: 39,
+                y1: 29
+            }
+        );
     }
 }

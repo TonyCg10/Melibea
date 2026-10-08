@@ -33,7 +33,8 @@ impl Text {
             return Err("fc-match found no monospace font".to_owned());
         }
         let bytes = std::fs::read(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
-        let font = FontVec::try_from_vec(bytes).map_err(|_| format!("{path} is not a usable font"))?;
+        let font =
+            FontVec::try_from_vec(bytes).map_err(|_| format!("{path} is not a usable font"))?;
         Ok(Text::from_font(font))
     }
 
@@ -44,7 +45,10 @@ impl Text {
     #[allow(clippy::cast_possible_truncation, reason = "glyph metrics are small")]
     fn line_size(&self, s: &str, size: f32) -> (i32, i32) {
         let scaled = self.font.as_scaled(PxScale::from(size));
-        let width: f32 = s.chars().map(|c| scaled.h_advance(self.font.glyph_id(c))).sum();
+        let width: f32 = s
+            .chars()
+            .map(|c| scaled.h_advance(self.font.glyph_id(c)))
+            .sum();
         (width.ceil() as i32, scaled.height().ceil() as i32)
     }
 
@@ -87,9 +91,20 @@ pub fn label_size(text: &Text, label: &Label, px: i32) -> (i32, i32) {
 }
 
 #[allow(clippy::cast_precision_loss, reason = "font sizes are small integers")]
-pub fn draw_label(text: &Text, canvas: &mut Canvas, label: &Label, at: (i32, i32), px: i32) -> Rect {
+pub fn draw_label(
+    text: &Text,
+    canvas: &mut Canvas,
+    label: &Label,
+    at: (i32, i32),
+    px: i32,
+) -> Rect {
     let (w, h) = label_size(text, label, px);
-    let background = Rect { x: at.0, y: at.1, w, h };
+    let background = Rect {
+        x: at.0,
+        y: at.1,
+        w,
+        h,
+    };
     canvas.fill(background, LABEL_BG);
 
     let main_size = (MAIN_SIZE * px) as f32;
@@ -114,8 +129,22 @@ mod tests {
     #[test]
     fn longer_text_is_wider() {
         let text = Text::load().expect("a monospace font via fc-match");
-        let short = label_size(&text, &Label { main: "1 × 1", detail: "box" }, 1);
-        let long = label_size(&text, &Label { main: "1234 × 5678", detail: "box" }, 1);
+        let short = label_size(
+            &text,
+            &Label {
+                main: "1 × 1",
+                detail: "box",
+            },
+            1,
+        );
+        let long = label_size(
+            &text,
+            &Label {
+                main: "1234 × 5678",
+                detail: "box",
+            },
+            1,
+        );
         assert!(long.0 > short.0);
         assert!(short.1 > 0);
     }
@@ -125,7 +154,10 @@ mod tests {
         let text = Text::load().expect("a monospace font via fc-match");
         let (width, height) = (200u32, 80u32);
         let mut data = [255u8, 255, 255, 255].repeat((width * height) as usize);
-        let label = Label { main: "412 × 38", detail: "box · tol 30 · DP-1" };
+        let label = Label {
+            main: "412 × 38",
+            detail: "box · tol 30 · DP-1",
+        };
         let touched = draw_label(
             &text,
             &mut Canvas::new(&mut data, width, height, width * 4),
@@ -136,10 +168,15 @@ mod tests {
         for y in 0..height {
             for x in 0..width {
                 let i = ((y * width + x) * 4) as usize;
-                let inside = (touched.x..touched.x + touched.w).contains(&i32::try_from(x).unwrap())
+                let inside = (touched.x..touched.x + touched.w)
+                    .contains(&i32::try_from(x).unwrap())
                     && (touched.y..touched.y + touched.h).contains(&i32::try_from(y).unwrap());
                 if !inside {
-                    assert_eq!(&data[i..i + 3], &[255, 255, 255], "({x},{y}) painted outside");
+                    assert_eq!(
+                        &data[i..i + 3],
+                        &[255, 255, 255],
+                        "({x},{y}) painted outside"
+                    );
                 }
             }
         }

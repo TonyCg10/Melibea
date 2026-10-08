@@ -12,7 +12,10 @@ pub struct Image {
 impl Image {
     pub fn new(width: u32, height: u32, stride: u32, data: Vec<u8>) -> Image {
         assert!(stride >= width * 4, "stride shorter than a row");
-        assert!(data.len() >= stride as usize * height as usize, "data shorter than the frame");
+        assert!(
+            data.len() >= stride as usize * height as usize,
+            "data shorter than the frame"
+        );
         Image {
             width,
             height,
@@ -104,7 +107,10 @@ impl Image {
         let (pw, ph) = (self.width, self.height);
         let quarter = matches!(
             transform,
-            Transform::Rotated90 | Transform::Rotated270 | Transform::Flipped90 | Transform::Flipped270
+            Transform::Rotated90
+                | Transform::Rotated270
+                | Transform::Flipped90
+                | Transform::Flipped270
         );
         let (width, height) = if quarter { (ph, pw) } else { (pw, ph) };
         // Each logical pixel (x, y) is read from this framebuffer pixel.
@@ -143,13 +149,20 @@ mod tests {
     #[test]
     fn stride_padding_is_skipped() {
         // Two rows of one pixel each, 8 bytes per row.
-        let image = Image::new(1, 2, 8, vec![1, 1, 1, 0, 9, 9, 9, 9, 2, 2, 2, 0, 9, 9, 9, 9]);
+        let image = Image::new(
+            1,
+            2,
+            8,
+            vec![1, 1, 1, 0, 9, 9, 9, 9, 2, 2, 2, 0, 9, 9, 9, 9],
+        );
         assert_eq!(image.rgb(0, 1), [2, 2, 2]);
     }
 
     #[test]
     fn from_rgb_round_trips() {
-        let image = Image::from_rgb(3, 2, |x, y| [u8::try_from(x).unwrap(), u8::try_from(y).unwrap(), 7]);
+        let image = Image::from_rgb(3, 2, |x, y| {
+            [u8::try_from(x).unwrap(), u8::try_from(y).unwrap(), 7]
+        });
         assert_eq!(image.rgb(2, 1), [2, 1, 7]);
         assert_eq!(image.width(), 3);
         assert_eq!(image.height(), 2);

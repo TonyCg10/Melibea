@@ -49,7 +49,10 @@ pub struct Canvas<'a> {
 }
 
 impl<'a> Canvas<'a> {
-    #[allow(clippy::cast_possible_wrap, reason = "output sizes are far below i32::MAX")]
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "output sizes are far below i32::MAX"
+    )]
     pub fn new(data: &'a mut [u8], width: u32, height: u32, stride: u32) -> Canvas<'a> {
         Canvas {
             data,
@@ -63,8 +66,14 @@ impl<'a> Canvas<'a> {
         (self.width, self.height)
     }
 
-    #[allow(clippy::cast_sign_loss, reason = "x and y are checked non-negative first")]
-    #[allow(clippy::many_single_char_names, reason = "x, y and the r, g, b, a channels")]
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "x and y are checked non-negative first"
+    )]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "x, y and the r, g, b, a channels"
+    )]
     pub fn blend(&mut self, x: i32, y: i32, color: Rgba) {
         if x < 0 || y < 0 || x >= self.width || y >= self.height {
             return;
@@ -115,7 +124,10 @@ pub struct Guides {
 
 impl Guides {
     pub fn new(px: i32) -> Guides {
-        Guides { px, cores: Vec::new() }
+        Guides {
+            px,
+            cores: Vec::new(),
+        }
     }
 
     fn line(&mut self, from: (i32, i32), to: (i32, i32)) {
@@ -143,9 +155,17 @@ impl Guides {
         self.line((at.0, at.1 - arm), (at.0, at.1 + arm));
     }
 
-    #[allow(clippy::cast_possible_wrap, reason = "output sizes are far below i32::MAX")]
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "output sizes are far below i32::MAX"
+    )]
     pub fn spacing(&mut self, bounds: Bounds, at: (i32, i32)) {
-        let (x0, y0, x1, y1) = (bounds.x0 as i32, bounds.y0 as i32, bounds.x1 as i32, bounds.y1 as i32);
+        let (x0, y0, x1, y1) = (
+            bounds.x0 as i32,
+            bounds.y0 as i32,
+            bounds.x1 as i32,
+            bounds.y1 as i32,
+        );
         let tick = 4 * self.px;
         self.line((x0, at.1), (x1, at.1));
         self.line((at.0, y0), (at.0, y1));
@@ -156,7 +176,10 @@ impl Guides {
     }
 
     /// The box's outline, drawn just outside it so its edge pixels stay visible.
-    #[allow(clippy::cast_possible_wrap, reason = "output sizes are far below i32::MAX")]
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "output sizes are far below i32::MAX"
+    )]
     pub fn boxed(&mut self, bounds: Bounds) {
         let px = self.px;
         let left = bounds.x0 as i32 - 2 * px;
@@ -237,29 +260,89 @@ mod tests {
     fn fills_are_clipped_and_report_what_they_touched() {
         let mut data = canvas_data(10, 10);
         let mut canvas = Canvas::new(&mut data, 10, 10, 40);
-        let touched = canvas.fill(Rect { x: 8, y: -2, w: 5, h: 4 }, [0, 0, 0, 255]);
-        assert_eq!(touched, Some(Rect { x: 8, y: 0, w: 2, h: 2 }));
-        assert_eq!(canvas.fill(Rect { x: 20, y: 0, w: 5, h: 5 }, [0, 0, 0, 255]), None);
+        let touched = canvas.fill(
+            Rect {
+                x: 8,
+                y: -2,
+                w: 5,
+                h: 4,
+            },
+            [0, 0, 0, 255],
+        );
+        assert_eq!(
+            touched,
+            Some(Rect {
+                x: 8,
+                y: 0,
+                w: 2,
+                h: 2
+            })
+        );
+        assert_eq!(
+            canvas.fill(
+                Rect {
+                    x: 20,
+                    y: 0,
+                    w: 5,
+                    h: 5
+                },
+                [0, 0, 0, 255]
+            ),
+            None
+        );
     }
 
     #[test]
     fn rects_union() {
-        let a = Rect { x: 0, y: 0, w: 2, h: 2 };
-        let b = Rect { x: 5, y: 1, w: 1, h: 4 };
-        assert_eq!(a.union(b), Rect { x: 0, y: 0, w: 6, h: 5 });
+        let a = Rect {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 2,
+        };
+        let b = Rect {
+            x: 5,
+            y: 1,
+            w: 1,
+            h: 4,
+        };
+        assert_eq!(
+            a.union(b),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 6,
+                h: 5
+            }
+        );
     }
 
     #[test]
     fn the_box_outline_leaves_the_measured_pixels_alone() {
         let mut data = canvas_data(30, 30);
-        let bounds = Bounds { x0: 10, y0: 10, x1: 19, y1: 19 };
+        let bounds = Bounds {
+            x0: 10,
+            y0: 10,
+            x1: 19,
+            y1: 19,
+        };
         let mut guides = Guides::new(1);
         guides.boxed(bounds);
-        let touched = guides.paint(&mut Canvas::new(&mut data, 30, 30, 120)).unwrap();
+        let touched = guides
+            .paint(&mut Canvas::new(&mut data, 30, 30, 120))
+            .unwrap();
         for (x, y) in [(10, 10), (19, 19), (10, 19), (19, 10), (15, 15)] {
-            assert_eq!(pixel(&data, 30, x, y), [255, 255, 255], "({x},{y}) was painted");
+            assert_eq!(
+                pixel(&data, 30, x, y),
+                [255, 255, 255],
+                "({x},{y}) was painted"
+            );
         }
-        assert_ne!(pixel(&data, 30, 9, 9), [255, 255, 255], "the outline is just outside");
+        assert_ne!(
+            pixel(&data, 30, 9, 9),
+            [255, 255, 255],
+            "the outline is just outside"
+        );
         assert!(touched.x <= 9 && touched.y <= 9);
         assert!(touched.x + touched.w >= 21 && touched.y + touched.h >= 21);
     }
@@ -267,12 +350,27 @@ mod tests {
     #[test]
     fn spacing_guides_cover_the_gap_and_report_it() {
         let mut data = canvas_data(30, 30);
-        let bounds = Bounds { x0: 5, y0: 8, x1: 24, y1: 20 };
+        let bounds = Bounds {
+            x0: 5,
+            y0: 8,
+            x1: 24,
+            y1: 20,
+        };
         let mut guides = Guides::new(1);
         guides.spacing(bounds, (12, 14));
-        let touched = guides.paint(&mut Canvas::new(&mut data, 30, 30, 120)).unwrap();
-        assert_ne!(pixel(&data, 30, 5, 14), [255, 255, 255], "the row line reaches x0");
-        assert_ne!(pixel(&data, 30, 12, 20), [255, 255, 255], "the column line reaches y1");
+        let touched = guides
+            .paint(&mut Canvas::new(&mut data, 30, 30, 120))
+            .unwrap();
+        assert_ne!(
+            pixel(&data, 30, 5, 14),
+            [255, 255, 255],
+            "the row line reaches x0"
+        );
+        assert_ne!(
+            pixel(&data, 30, 12, 20),
+            [255, 255, 255],
+            "the column line reaches y1"
+        );
         assert!(touched.x <= 5 && touched.x + touched.w >= 25);
         assert!(touched.y <= 8 && touched.y + touched.h >= 21);
     }
@@ -282,19 +380,39 @@ mod tests {
         let mut data = canvas_data(30, 30);
         let mut guides = Guides::new(1);
         guides.crosshair((15, 15));
-        guides.boxed(Bounds { x0: 5, y0: 5, x1: 24, y1: 24 });
+        guides.boxed(Bounds {
+            x0: 5,
+            y0: 5,
+            x1: 24,
+            y1: 24,
+        });
         guides.paint(&mut Canvas::new(&mut data, 30, 30, 120));
         let accent = [ACCENT[0], ACCENT[1], ACCENT[2]];
         // Each of these is on one line's core and under a later line's outline.
-        assert_eq!(pixel(&data, 30, 14, 15), accent, "beside the crosshair's centre");
-        assert_eq!(pixel(&data, 30, 25, 3), accent, "the box's top-right corner");
-        assert_eq!(pixel(&data, 30, 4, 26), accent, "the box's bottom-left corner");
+        assert_eq!(
+            pixel(&data, 30, 14, 15),
+            accent,
+            "beside the crosshair's centre"
+        );
+        assert_eq!(
+            pixel(&data, 30, 25, 3),
+            accent,
+            "the box's top-right corner"
+        );
+        assert_eq!(
+            pixel(&data, 30, 4, 26),
+            accent,
+            "the box's bottom-left corner"
+        );
     }
 
     #[test]
     fn nothing_to_paint_touches_nothing() {
         let mut data = canvas_data(4, 4);
-        assert_eq!(Guides::new(1).paint(&mut Canvas::new(&mut data, 4, 4, 16)), None);
+        assert_eq!(
+            Guides::new(1).paint(&mut Canvas::new(&mut data, 4, 4, 16)),
+            None
+        );
         assert!(data.iter().all(|&b| b == 255));
     }
 

@@ -66,13 +66,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 mode = Some(match next_value(&mut args, "--measure")?.as_str() {
                     "box" => Mode::Box,
                     "spacing" => Mode::Spacing,
-                    other => return Err(format!("--measure must be box or spacing, got {other:?}")),
+                    other => {
+                        return Err(format!("--measure must be box or spacing, got {other:?}"));
+                    }
                 });
             }
             "--at" => {
                 let value = next_value(&mut args, "--at")?;
                 at = Some(
-                    parse_point(&value).ok_or_else(|| format!("--at must be X,Y, got {value:?}"))?,
+                    parse_point(&value)
+                        .ok_or_else(|| format!("--at must be X,Y, got {value:?}"))?,
                 );
             }
             "--output" => output = Some(next_value(&mut args, "--output")?),
@@ -127,7 +130,14 @@ mod tests {
     #[test]
     fn a_full_measure_command_parses() {
         assert_eq!(
-            parse(args(&["--measure", "box", "--at", "10.5,20", "--output", "DP-1"])),
+            parse(args(&[
+                "--measure",
+                "box",
+                "--at",
+                "10.5,20",
+                "--output",
+                "DP-1"
+            ])),
             Ok(Command::Measure {
                 mode: Mode::Box,
                 at: (10.5, 20.0),
@@ -145,7 +155,17 @@ mod tests {
 
     #[test]
     fn bad_values_are_refused() {
-        assert!(parse(args(&["--measure", "circle", "--at", "1,1", "--output", "X"])).is_err());
+        assert!(
+            parse(args(&[
+                "--measure",
+                "circle",
+                "--at",
+                "1,1",
+                "--output",
+                "X"
+            ]))
+            .is_err()
+        );
         assert!(parse(args(&["--tolerance", "300"])).is_err());
         assert!(parse(args(&["--tolerance"])).is_err());
         assert!(parse(args(&["--measure", "box", "--at", "1;1", "--output", "X"])).is_err());
