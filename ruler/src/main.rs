@@ -6,6 +6,7 @@
 // Task 7 removes this allow once every module has its caller.
 
 mod cli;
+mod edges;
 mod image;
 mod units;
 
