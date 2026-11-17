@@ -1,32 +1,56 @@
-# Standby for minimized applications — design
+# Standby — design
 
-Roadmap milestone: **M12 — Standby for minimized applications**
-([ROADMAP.md](../../../ROADMAP.md#m12--standby-for-minimized-applications)).
+Roadmap milestone: **M12 — Standby**
+([ROADMAP.md](../../../ROADMAP.md#m12--standby)).
 
-Status: proposed 2026-11-17, awaiting the author's decisions in
-[Open decisions](#open-decisions). No code yet.
+Status: proposed 2026-11-17, revised the same day after the author widened
+the scope from minimized windows to a dedicated suspend shortcut. Awaiting the
+decisions in [Open decisions](#open-decisions). No code yet.
 
 ## Purpose
 
-A minimized window today leaves the layout but its process keeps running:
-timers, animations, polling, JavaScript, background rendering. Standby extends
-minimization the way a console's suspend does: once an application has been
-minimized for a while, its processes are frozen, using no CPU at all, and they
-resume exactly where they were the moment it is restored.
+Suspend an application the way a console suspends a game: its processes stop
+completely, using no CPU, and resume exactly where they were.
 
-```text
-visible ──minimize──▶ minimized ──after delay──▶ minimized + frozen
-   ▲                     │                              │
-   └──────restore────────┘◀────────thaw, then restore───┘
-```
+Two ways in:
 
-Restoring a frozen window is instant on screen: niri keeps the tile's last
-committed buffer, so the old frame appears at once and the client starts
-answering a few milliseconds later, after the thaw.
+- **Suspend shortcut.** A bind suspends the focused window right where it is,
+  visible, tiled or fullscreen. The window keeps its place and shows its last
+  frame, blurred, with the application's identity drawn on top. The same bind,
+  or focusing the window and pressing a resume bind, wakes it.
+- **Standby after minimizing.** An opted-in application that stays minimized
+  past a configured delay is suspended in the background.
 
-## What freezing means here
+The target experience, reached in stages, is a fullscreen game frozen on its
+last frame, blurred, with the game's icon and name over it, and later a
+console-like game application in the author's suite that owns that screen.
 
-The **cgroup v2 freezer**, driven through systemd:
+## Who owns what
+
+This is the boundary the rest of the design follows. Each layer keeps the
+authority it already has; nothing moves.
+
+| Concern | Owner | Why there |
+|---|---|---|
+| The suspend and resume shortcuts | niri config, `spawn "melibea" "suspend"` | niri owns input; the bind just calls Melibea |
+| Deciding whether a window may be suspended | **Melibea** | it is the deterministic policy owner, and already decides for minimized windows |
+| Finding the processes behind a window | **Melibea**, from `/proc` and cgroups | the compositor knows a pid, not a process tree |
+| Freezing and thawing processes | **systemd** user manager, asked by Melibea | cgroup v2 freezer; systemd keeps unit state coherent on stop and logout |
+| Keeping the last frame on screen | **niri** (already does: a client that stops committing keeps its last buffer) | niri owns surfaces and rendering |
+| Blurring and dimming that frame | **niri fork** | a render effect on a window's own texture, like the magnifier; a client cannot do it without capturing the screen every frame |
+| Not sending input to a suspended window | **niri fork** | niri owns input routing; events sent to a frozen client only pile up in its socket |
+| Reporting that a window is suspended | **niri fork** IPC (`is_suspended`) and **Melibea** protocol v3 | niri states the visual fact, Melibea the process fact |
+| The card on top: icon, name, play time, "press to resume" | **the shell or the game application** | presentation; Melibea and niri never draw application identity |
+| Game metadata: cover art, title, store id, play time | **the game application**, outside these repos | only the launcher knows what a process *is* as a game |
+| Telling Melibea which unit a game runs in | **the game application**, through Melibea's protocol | see [Games under Xwayland](#games-under-xwayland) |
+
+In one sentence: **niri makes it look and feel frozen, Melibea decides and
+freezes it, systemd does the freezing, and the shell or game app explains it
+to the user.**
+
+## Freezing
+
+The cgroup v2 freezer, through systemd:
 
 ```sh
 systemctl --user freeze app-niri-firefox-4242.scope
@@ -35,220 +59,203 @@ systemctl --user thaw   app-niri-firefox-4242.scope
 
 Rejected alternatives:
 
-- **`SIGSTOP` / `SIGCONT` on the window's pid.** Freezes one process, not its
-  children (the shell, the build running in a terminal, a browser's content
-  processes). It is visible to parents doing job control, and a stray
-  `SIGCONT` from anyone undoes it.
-- **Writing `cgroup.freeze` directly.** Works, but systemd would not know the
-  unit is frozen. Going through systemd means `systemctl --user stop`, logout
-  and `FreezerState` all stay coherent, and a frozen unit is visible to anyone
-  with `systemctl --user list-units`.
-- **Freezing inside niri.** niri owns surfaces, not process policy. Melibea is
-  already the deterministic, configured policy owner for minimized windows.
+- **`SIGSTOP` / `SIGCONT`.** Stops one process, not its children (a game's
+  helper processes, a browser's content processes), is visible to parents doing
+  job control, and any stray `SIGCONT` undoes it.
+- **Writing `cgroup.freeze` directly.** Works, but systemd would not know, so
+  `systemctl stop`, logout and `FreezerState` would disagree with reality.
+- **Freezing inside niri.** niri owns surfaces, not process policy.
 
-Requirements: cgroup v2 and systemd ≥ 246 (the freeze verb). Both already
-hold wherever niri runs as a systemd service, which is also the only case in
-which niri puts spawned applications into their own `app-niri-*.scope`.
-
-## Ownership
-
-| Concern | Owner |
-|---|---|
-| Whether a window is minimized | niri (unchanged) |
-| Which processes belong to a window | the kernel and systemd, read by Melibea |
-| Whether and when to freeze | Melibea, from configuration |
-| The freeze itself | systemd's user manager |
-| How a frozen bubble looks | the shell (Celestina), from a state flag |
-
-The Niri fork is **not modified** for the core of this milestone. niri already
-reports `pid` for visible windows in `Windows` and for minimized ones in
-`MinimizedWindowsChanged`, and its spawn path already creates one transient
-scope per launched application.
+Requirements: cgroup v2 and systemd ≥ 246, which already hold wherever niri
+runs as a systemd service — the only case in which niri spawns applications
+into their own `app-niri-*.scope`.
 
 ## The safety rule
 
-Freezing the wrong cgroup can freeze the shell, the compositor, or Melibea
-itself, which would lock the session. So a unit is frozen only when **all** of
-the following hold at that moment, checked from `/proc`, never cached:
+Freezing the wrong cgroup can freeze the compositor, Melibea or the shell and
+lock the session. A unit is frozen only when all of the following hold at that
+moment, read from `/proc`, never cached:
 
-1. The window's pid resolves, through `/proc/<pid>/cgroup`, to a unit named
+1. The target resolves, through `/proc/<pid>/cgroup`, to a unit named
    `app-*.scope` or `app-*.service` under the user manager.
-2. The unit contains neither niri's pid nor Melibea's own.
-3. No **visible** window has a pid inside that unit. One process with several
-   windows (a browser, a single-instance terminal) is frozen only when every
-   one of its windows is minimized.
-4. Every process in the unit descends from a pid that owns one of the minimized
-   windows being frozen. This refuses a unit whose root is something else: a
-   shell that launched an application without its own scope, or a terminal
-   that is still visible.
-5. The minimized window matched a rule that opts it in (see
-   [Configuration](#configuration)).
+2. The unit contains neither niri's pid nor Melibea's.
+3. Every window whose pid is in the unit is being suspended together. For the
+   shortcut, that means the unit owns only the focused window, or the shortcut
+   suspends all of that unit's windows at once (open decision 1). For standby
+   after minimizing, every one of the unit's windows is minimized.
+4. Every process in the unit descends from a pid that owns one of those
+   windows, or from the root process a game application registered for it.
+   This refuses a shell, or a still-visible terminal, that launched something
+   without its own scope.
+5. For standby after minimizing only: a `[[standby]]` rule opts the window in.
+   The shortcut is an explicit request and needs no rule.
 
-Rule 4 is what excludes `xwayland-satellite` (spawned into niri's own cgroup),
-Celestina and anything it launched without a scope, and applications started
-from a terminal that is still open.
+A refusal leaves the window untouched and running. The shortcut reports why
+through Melibea's action result, and `melibea status` explains it.
 
-If any check fails, the window simply stays minimized and running, and
-`melibea status` explains which rule refused it.
+## Suspend sequence
 
-## Configuration
+```text
+bind ─▶ melibea suspend
+          ├─ safety rule passes?  no ─▶ result "blocked: <reason>", nothing changes
+          ├─ ledger += unit
+          ├─ niri: set-window-suspended --id W true   (blur on, input off)
+          └─ systemctl --user freeze UNIT
+```
 
-Opt-in per application, never global, because freezing has consequences only
-the user can weigh (see [Known effects](#known-effects)):
+Visual first, freeze second: the blur covers the window before the client
+stops, so there is no visible moment of a frozen window that still looks live
+and silently drops input. If the freeze fails, Melibea clears the niri flag
+and removes the ledger entry.
+
+Resume runs in reverse: thaw, wait for systemd to report it thawed, then clear
+niri's flag, so the window takes input only once its client can answer.
+
+While suspended, niri:
+
+- keeps rendering the window's last buffer, blurred and dimmed, with the blur
+  radius and dim taken from a `suspend { }` config block;
+- sends it no keyboard, pointer or touch events and does not give it keyboard
+  focus, but still lets the user focus its tile, so resume can target it;
+- keeps it in the layout and in `Windows` IPC, with `is_suspended: true`;
+- does not unredirect it for direct scanout, since the blur needs composition.
+
+## Standby after minimizing
+
+Unchanged from the first draft, now as the second entry point:
 
 ```toml
 [[standby]]
-app_id = "^(firefox|chromium|code)$"
-after = "2m"          # minimized this long before freezing; "0s" is immediate
-
-[[standby]]
-app_id = "^kitty$"
-title = "^btop"
-after = "30s"
+app_id = "^(firefox|code)$"
+after = "2m"   # minimized this long before freezing; "0s" is immediate
 ```
 
-Same matching semantics as `[[attention]]`: top to bottom, first match wins,
-both matchers must match when both are present. With no `[[standby]]` rules,
-Melibea behaves exactly as today.
+Matched like `[[attention]]`: top to bottom, first match wins. With no rules,
+nothing is suspended in the background. Melibea freezes when the delay
+elapses, thaws before restoring or closing on its own action paths, and thaws
+at once when it sees niri restore the window directly. A minimized window
+needs no blur: it is not on screen.
 
-The delay exists because most minimizations are short. Freezing and thawing
-are cheap, but a delay keeps a quick minimize/restore from paying even that,
-and keeps background work like a finishing download from being interrupted
-by a moment's minimization.
+## Games under Xwayland
 
-## Lifecycle
+The hardest case for the end goal. A game running through Proton or another X11
+path is reported by niri with the pid of `xwayland-satellite`, not the game's.
+Satellite lives in niri's own cgroup, so the safety rule refuses it, correctly:
+freezing it would freeze every X11 application.
 
-**Freeze.** When a minimized window's delay elapses, Melibea re-runs the
-safety rule and runs `systemctl --user freeze UNIT`. A window that is restored
-or closed before the delay elapses cancels its timer.
+So for these games, Melibea cannot find the processes from the window alone.
+The fix belongs to whoever launches the game:
 
-**Restore through Melibea** (Celestina's path). Thaw first, wait for
-`systemctl` to return (it waits for the cgroup to report thawed), then send
-niri's restore. The client is already running when its tile reappears.
+- **The future game application** launches each game in its own unit
+  (`systemd-run --user --scope --unit=app-game-<id>`) and registers it with
+  Melibea over the protocol: "window W, or the next fullscreen window on output
+  O, belongs to unit U". Melibea still applies rules 1, 2 and 4 to that unit.
+- **Until then**, games launched through Steam run inside Steam's own unit.
+  Suspending them would freeze the Steam client too. That is refused by default
+  and could later become a deliberate opt-in.
 
-**Restore through niri directly** (`niri msg action restore-window`, a niri
-bind). niri restores the tile with its last buffer; Melibea sees `Restored` in
-the event stream and thaws at once. The window is visible but unresponsive for
-the few milliseconds in between.
-
-**Close through Melibea.** Thaw first, then send close: a frozen client cannot
-answer `xdg_toplevel.close`.
-
-**Close through niri directly.** Not intercepted: the request reaches a frozen
-client and waits there until something thaws it. Documented as a known gap;
-Celestina always goes through Melibea.
-
-**Another window of the same unit becomes visible.** A frozen unit cannot map
-new windows, but before its delay elapses a running application may open one.
-Rule 3 is checked again at freeze time, and if a frozen unit ever gains a
-visible window anyway (one of its windows restored through niri directly), it
-is thawed immediately.
-
-**Clipboard.** If a frozen client owns the current selection, a paste in
-another application would hang waiting for it. Melibea cannot see the
-selection owner through niri IPC today, so the first version thaws nothing on
-paste and lists this under known effects. See open decision 3.
+Native Wayland games launched through niri `spawn` need nothing: their window
+pid is their own and their scope is their own.
 
 ## Recovery
 
 Frozen processes must never outlive the reason they were frozen.
 
-- Melibea writes every unit it freezes to a ledger,
-  `$XDG_RUNTIME_DIR/melibea/standby`, before freezing it, and removes it after
-  thawing it. It never thaws a unit it did not freeze.
-- On start, and after every niri reconnection, Melibea reconciles the ledger
-  against a fresh snapshot: any ledger unit whose windows are not all
-  minimized, or whose rule no longer opts it in, is thawed.
-- `melibea thaw-all` thaws every ledger unit. The systemd unit gains
-  `ExecStopPost=%h/.local/bin/melibea thaw-all`, so a crash or a stop of
-  Melibea releases everything it held.
-- If niri itself dies, its clients are disconnected. A frozen client learns
-  that only when thawed, so `ExecStopPost` and the next start's reconciliation
-  matter here too. A reboot clears everything regardless: the ledger lives in
-  the runtime directory.
+- Melibea records each unit in `$XDG_RUNTIME_DIR/melibea/standby` before
+  freezing it and removes it after thawing. It never thaws a unit it did not
+  freeze.
+- On start and after every niri reconnection it reconciles the ledger against
+  a fresh snapshot and thaws anything no longer justified, also clearing niri's
+  suspended flag.
+- `melibea thaw-all` thaws every ledger unit; the service unit runs it from
+  `ExecStopPost`, so a crash or stop of Melibea releases everything.
+- If niri restarts, its suspended flags are gone with it; reconciliation thaws
+  the units. A reboot clears everything: the ledger lives in the runtime
+  directory.
 
 ## Protocol
 
-Shells need to know a bubble is in standby to show it (dimmed, a moon or
-snowflake). Protocol v1 and v2 state payloads are fixed, so this is a
-**protocol v3**: each minimized entry gains
+Melibea protocol v3 (v1 and v2 payloads stay fixed):
 
-```json
-{ "id": 42, "app_id": "firefox", "title": "…", "standby": true }
-```
+- `suspend` and `resume` actions, optional window id, focused window by default,
+  with the same semantic results as minimize (`applied`, `already_in_state`,
+  `window_not_found`, `blocked` with a reason).
+- `register_unit`, for launchers: binds a window, or the next fullscreen window
+  on an output, to a unit they started.
+- A `suspended` list in state: window id, app id, title, output, whether it is
+  fullscreen, and whether it is also minimized. Ordered, revisioned and
+  snapshot-first like the minimized list, so a shell or game application can
+  draw its card from the first message and follow changes without races.
 
-and a change in `standby` is an ordinary ordered `updated` change carrying a
-new revision. v1 and v2 subscribers see exactly what they see today. No new
-actions: restore and close already do the right thing.
+The card's position comes from niri's window geometry, which the shell already
+reads; for a fullscreen window it is simply the output.
+
+## Changes to the Niri fork
+
+Now required, where the first draft needed none:
+
+- A per-window `suspended` flag set by a new action
+  `set-window-suspended --id W true|false`, also over IPC.
+- Rendering a suspended window's texture through the existing blur passes, plus
+  a dim, configured by `suspend { blur-radius dim }`.
+- Input exclusion for suspended windows, and no direct scanout for them.
+- `is_suspended` in the `Window` IPC record and its change event.
+
+None of this touches process state; niri never freezes anything.
 
 ## Known effects
 
-Freezing is a real suspension, not a power hint, and these follow from it.
-They are why the feature is opt-in per application.
-
-- **Audio and video stop.** A frozen music player is silent.
-- **Network sessions may drop.** An SSH session in a frozen terminal times out
-  after the server's keep-alive; a frozen chat client misses its websocket.
-- **D-Bus calls to a frozen client block** until their timeout (25 s by
-  default) — notifications actions, MPRIS, portals.
-- **Clipboard ownership**, as above.
-- **Wayland events are queued for the frozen client.** Minimized windows get
-  no frame callbacks or input, so traffic is small (output changes, keymap,
-  selection offers), but libwayland disconnects a client whose buffer fills.
-  This is the main thing the spike must measure, see below.
+- Audio and video stop; network sessions may time out (SSH, multiplayer).
+- D-Bus calls to a frozen client block until their timeout (25 s by default).
+- A paste from a frozen client's selection hangs until it is thawed.
+- Wayland events still queue for the frozen client; libwayland disconnects a
+  client whose buffer fills. Input exclusion removes most of that traffic,
+  but the spike must measure what remains.
+- A suspended game keeps its RAM and VRAM, as on a console.
 
 ## Validation plan
 
-A spike in a disposable nested niri before any daemon integration, in the
-same style as M3:
+A spike in a disposable nested niri before daemon integration, as in M3:
 
-1. Confirm that a nested niri running as a systemd service spawns into
-   `app-niri-*.scope`, and that `systemctl --user freeze` on it drops the
-   client's CPU to zero (`/proc/<pid>/stat` utime stops moving).
-2. Freeze a minimized GTK window and a minimized Firefox, then generate
-   compositor traffic for 10 minutes: output scale changes, keymap changes,
-   clipboard copies in other clients. The frozen clients must survive the
-   thaw. If libwayland disconnects them, the fix belongs in the Niri fork
-   (raising the client buffer limit with `wl_display_set_default_max_buffer_size`,
-   or not sending non-essential events to frozen clients) and this design is
-   revised before M12 continues.
-3. Restore through niri directly and through Melibea; time from request to the
-   client's first new commit.
-4. Kill Melibea with `SIGKILL` while a unit is frozen; `ExecStopPost` must thaw
-   it. Restart Melibea with a stale ledger; reconciliation must thaw it.
-5. Negative cases for every clause of the safety rule: an application launched
-   from a visible terminal, a browser with one window minimized and one visible,
-   `xwayland-satellite`, an application launched by Celestina without a scope.
-   None may freeze.
+1. Freeze a native Wayland game or demo and a GTK window through their
+   `app-niri-*` scopes; CPU time must stop and resume on thaw.
+2. Hold them frozen ten minutes while generating compositor traffic (scale and
+   keymap changes, clipboard copies elsewhere); they must survive the thaw.
+3. Blur and input exclusion in the fork: a suspended fullscreen window shows its
+   blurred last frame, takes no input, and resumes on the bind.
+4. `SIGKILL` Melibea while a unit is frozen; `ExecStopPost` must thaw it and a
+   restart must clear any niri flag left behind.
+5. Every clause of the safety rule refuses: an application launched from a
+   visible terminal, one browser window of two, `xwayland-satellite`, a Steam
+   game, anything Celestina launched without a scope.
 
 ## Exit criteria
 
-- With no `[[standby]]` rules, behavior and protocol v1/v2 output are
-  unchanged byte for byte.
-- An opted-in application minimized past its delay uses no CPU, and restores
-  through Celestina with its state intact.
-- No configuration can freeze niri, Melibea, the shell, or a unit with a
-  visible window; each refusal is explained by `melibea status`.
-- No frozen unit survives Melibea stopping, crashing, or restarting.
-- Unit tests cover the safety rule against constructed `/proc` and cgroup
-  trees, timer cancellation, ledger reconciliation, and v3 projection.
+- The suspend bind freezes the focused eligible window, shows it blurred, and
+  the resume bind wakes it with its state intact.
+- Standby after minimizing works for opted-in applications only.
+- With no binds and no `[[standby]]` rules, behavior and protocol v1/v2 output
+  are unchanged byte for byte.
+- No request can freeze niri, Melibea, the shell, `xwayland-satellite`, or a
+  unit with a window that is not being suspended; every refusal is explained.
+- No frozen unit survives Melibea stopping, crashing or restarting.
 
-## Out of scope
+## Out of scope for these repositories
 
-- Thermal or battery policy (freezing on its own when not minimized).
-- Freezing windows that are merely on another workspace or off screen.
-- Saving process state to disk (true hibernation of an application).
-- Manual `freeze`/`thaw` commands for windows that are not minimized.
-- Changes to the Niri fork, unless spike step 2 shows they are required.
+- The game application: library, cover art, play time, the console-style
+  suspended screen. It is a protocol consumer like Celestina.
+- Drawing application identity anywhere in niri or Melibea.
+- Saving process state to disk, or resuming after a reboot.
+- Battery or thermal policy that suspends without the user asking.
 
 ## Open decisions
 
-1. **Default delay** when a rule omits `after`. Proposed: rules must state it,
-   no default.
-2. **Bubble presentation** of standby in Celestina: dimmed, an icon, or
-   nothing. Shell work, but it decides whether v3 is worth adding in the first
-   version or can follow later.
-3. **Clipboard.** Accept the known effect, or extend the Niri fork to report
-   the selection owner's pid so Melibea can refuse to freeze it.
-4. **Milestone order.** M10 (the ruler) is planned and not started; the roadmap
-   keeps one active milestone. Which goes first?
+1. **Shortcut on a multi-window application.** Suspend all of that unit's
+   windows together, or refuse unless the focused window is its only one?
+   Proposed: suspend all, each blurred, since they freeze together anyway.
+2. **The card before the game application exists.** Celestina draws a minimal
+   one (icon and name) from protocol v3, or nothing until the game app.
+3. **Steam games.** Refuse, or allow freezing Steam's whole unit as an explicit
+   opt-in.
+4. **Milestone order.** M10 (the ruler) is planned and not started, and the
+   roadmap keeps one active milestone.
