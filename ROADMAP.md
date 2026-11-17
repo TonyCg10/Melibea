@@ -17,7 +17,7 @@ M0 Foundation (done)
       -> M6 Celestina bubble integration (complete)
       -> M7 Coordinated bubble motion (complete, one criterion deferred)
       -> M8 Optional expansions
-      -> M12 Standby for minimized applications (proposed)
+      -> M12 Standby (proposed)
   -> M9 Screen magnifier (complete, in the Niri fork)
       -> M10 Screen ruler companion binary (built; awaiting real-session check)
   -> M11 Binding modes (complete, in the Niri fork)
@@ -263,7 +263,7 @@ does not live here.
 - It works on each output of a mixed-DPI, mixed-refresh session.
 - It runs with `melibea.service` stopped.
 
-## M12 — Standby for minimized applications
+## M12 — Standby
 
 **Status:** proposed 2026-11-17; design awaiting the author's decisions
 
@@ -271,28 +271,33 @@ does not live here.
 
 ### Outcome
 
-An opted-in application that stays minimized past a configured delay is
-frozen with the cgroup v2 freezer through `systemctl --user freeze`, using no
-CPU, and is thawed before or as it is restored, like a console's suspend.
+A bind suspends the focused window like a console suspends a game: its
+systemd unit is frozen with the cgroup v2 freezer, and niri keeps its last
+frame on screen, blurred, without delivering input, until the window is
+resumed. Opted-in applications are also suspended after staying minimized
+past a configured delay.
 
 ### In
 
-- `[[standby]]` rules with an explicit delay, matched like `[[attention]]`.
-- A safety rule that never freezes niri, Melibea, the shell, or a unit with a
-  visible window, checked from `/proc` at freeze time.
-- Thaw-before-restore and thaw-before-close on Melibea's action paths.
+- `suspend` and `resume` in Melibea, bound through niri `spawn`.
+- `[[standby]]` rules with an explicit delay for minimized windows.
+- A safety rule, checked from `/proc`, that never freezes niri, Melibea, the
+  shell, `xwayland-satellite`, or a unit with a window not being suspended.
 - A ledger, start-up reconciliation and `thaw-all` from `ExecStopPost`.
-- Protocol v3 adding a `standby` flag per minimized entry.
+- Protocol v3: suspend and resume actions, unit registration for launchers,
+  and an ordered suspended-window list.
+- In the Niri fork: a per-window suspended flag rendered with the existing
+  blur, input exclusion, and `is_suspended` in IPC.
 
 ### Out
 
-- Changes to the Niri fork, unless the spike shows libwayland disconnects
-  frozen clients.
-- Freezing windows that are not minimized; saving process state to disk.
+- The console-style game application and any drawing of application identity;
+  they consume protocol v3 from outside these repositories.
+- Saving process state to disk.
 
 ## Where the Niri fork lives
 
-M4, M7, M9 and M11 are code in the Niri fork, not in this repository. The fork
+M4, M7, M9, M11 and part of M12 are code in the Niri fork, not in this repository. The fork
 is GPL-3.0, like niri, and is kept as its own repository rather than inside
 this MIT one: <https://github.com/TonyCg10/niri-melibea>, branch `main`, on
 top of upstream niri `8ed0da4`.
