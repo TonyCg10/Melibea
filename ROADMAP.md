@@ -17,6 +17,7 @@ M0 Foundation (done)
       -> M6 Celestina bubble integration (complete)
       -> M7 Coordinated bubble motion (complete, one criterion deferred)
       -> M8 Optional expansions
+      -> M12 Standby for minimized applications (proposed)
   -> M9 Screen magnifier (complete, in the Niri fork)
       -> M10 Screen ruler companion binary (planned)
   -> M11 Binding modes (complete, in the Niri fork)
@@ -872,6 +873,33 @@ not at runtime. This is an exit criterion rather than a nicety.
 - A configuration with no modes behaves exactly as it does today.
 - Reloading the configuration while inside a mode leaves the session in a
   defined state rather than in a mode that no longer exists.
+
+## M12 — Standby for minimized applications
+
+**Status:** proposed 2026-11-17; design awaiting the author's decisions
+
+**Design:** [docs/superpowers/specs/2026-11-17-melibea-standby-design.md](docs/superpowers/specs/2026-11-17-melibea-standby-design.md)
+
+### Outcome
+
+An opted-in application that stays minimized past a configured delay is
+frozen with the cgroup v2 freezer through `systemctl --user freeze`, using no
+CPU, and is thawed before or as it is restored, like a console's suspend.
+
+### In
+
+- `[[standby]]` rules with an explicit delay, matched like `[[attention]]`.
+- A safety rule that never freezes niri, Melibea, the shell, or a unit with a
+  visible window, checked from `/proc` at freeze time.
+- Thaw-before-restore and thaw-before-close on Melibea's action paths.
+- A ledger, start-up reconciliation and `thaw-all` from `ExecStopPost`.
+- Protocol v3 adding a `standby` flag per minimized entry.
+
+### Out
+
+- Changes to the Niri fork, unless the spike shows libwayland disconnects
+  frozen clients.
+- Freezing windows that are not minimized; saving process state to disk.
 
 ## Where the Niri fork lives
 
