@@ -1846,7 +1846,7 @@ mod tests {
         let blocked = StandbyOutcome::Blocked {
             operation: StandbyOperation::Suspend,
             window_id: Some(608),
-            reason: BlockReason::NotAGame,
+            reason: BlockReason::NotAGame(None),
         };
         let result = standby_action_result(&blocked, Some(608));
         assert_eq!(result.operation, Operation::Suspend);

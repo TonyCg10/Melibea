@@ -5,7 +5,7 @@
 //! later step runs, and every failure after a change undoes it, so nothing
 //! stays frozen or flagged by a suspension that did not complete.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -16,6 +16,7 @@ use super::games::{GameIdentity, GameRules, RecognizedGame, game_set};
 use super::ledger::{Ledger, LedgerEntry};
 use super::process::{ProcessInfo, ProcessTable, app_unit};
 use super::systemd::{FreezerState, Systemd, game_unit_name, is_game_unit};
+use super::x11::OwnerLookup;
 use crate::niri_ipc::{NiriActionClient, NiriActionError, NiriWindowActionStatus};
 use crate::protocol::{ActionResult, ActionStatus, Operation};
 use crate::transition::WindowId;
@@ -152,6 +153,47 @@ impl Compositor for LiveCompositor {
     }
 }
 
+/// The X11 owner lookups of one suspension: each `(app id, title)` is asked
+/// once, and nothing more is asked after a lookup failed.
+#[derive(Debug, Default)]
+struct LookupCache {
+    answers: BTreeMap<(String, String), Result<OwnerLookup, String>>,
+    failure: Option<String>,
+}
+
+impl LookupCache {
+    /// `owners` seen through this cache.
+    fn over<'a>(&'a mut self, owners: &'a mut dyn WindowOwners) -> CachedOwners<'a> {
+        CachedOwners {
+            cache: self,
+            owners,
+        }
+    }
+}
+
+struct CachedOwners<'a> {
+    cache: &'a mut LookupCache,
+    owners: &'a mut dyn WindowOwners,
+}
+
+impl WindowOwners for CachedOwners<'_> {
+    fn owner(&mut self, app_id: &str, title: &str) -> Result<OwnerLookup, String> {
+        let key = (app_id.to_owned(), title.to_owned());
+        if let Some(answer) = self.cache.answers.get(&key) {
+            return answer.clone();
+        }
+        if let Some(error) = &self.cache.failure {
+            return Err(error.clone());
+        }
+        let answer = self.owners.owner(app_id, title);
+        if let Err(error) = &answer {
+            self.cache.failure = Some(error.clone());
+        }
+        self.cache.answers.insert(key, answer.clone());
+        answer
+    }
+}
+
 /// Which way a standby request goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StandbyOperation {
@@ -162,9 +204,10 @@ pub enum StandbyOperation {
 /// Why a standby request changed nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockReason {
-    NotAGame,
-    /// Several processes own windows named like the target (X11).
-    AmbiguousOwner(String),
+    /// The window is not a recognized game, with why when detection was
+    /// attempted (the owner is no game, the X11 lookup failed or was
+    /// ambiguous).
+    NotAGame(Option<String>),
     GameNotRunning,
     ProtectedProcess {
         pid: u32,
@@ -184,7 +227,7 @@ impl BlockReason {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
-            Self::NotAGame | Self::AmbiguousOwner(_) => "not_a_game",
+            Self::NotAGame(_) => "not_a_game",
             Self::GameNotRunning => "game_not_running",
             Self::ProtectedProcess { .. } => "protected_process",
             Self::GameEscaped { .. } => "game_escaped",
@@ -199,9 +242,9 @@ impl BlockReason {
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
-            Self::NotAGame => "the window is not a recognized game".into(),
-            Self::AmbiguousOwner(text) => {
-                format!("the window is not a recognized game: {text}")
+            Self::NotAGame(None) => "the window is not a recognized game".into(),
+            Self::NotAGame(Some(why)) => {
+                format!("the window is not a recognized game: {why}")
             }
             Self::GameNotRunning => "no process of the game is running".into(),
             Self::ProtectedProcess { pid, comm } => {
@@ -566,17 +609,13 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
         Ok(units.into_iter().collect())
     }
 
-    /// Step 2: a rule or `steam_app_<N>` first, else the owner's environment
-    /// read from `table`.
-    fn recognize(
-        rules: &GameRules,
+    /// The owner's environment read from `table`, for a window no rule and
+    /// no `steam_app_<N>` recognized.
+    fn detected(
         owners: &mut dyn WindowOwners,
         table: &ProcessTable,
         window: &WindowView,
     ) -> Result<Option<RecognizedGame>, String> {
-        if let Some(game) = rules.recognize(window.app_id.as_deref(), window.title.as_deref()) {
-            return Ok(Some(game));
-        }
         Ok(
             detect(window, table, owners)?.map(|identity| RecognizedGame {
                 identity,
@@ -619,11 +658,20 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
         // Step 2: recognize.
         let rules = GameRules::load(&self.games_path)
             .map_err(|error| block(BlockReason::InvalidRules(error.to_string())))?;
-        // Detection needs the process table, so one snapshot precedes discovery.
-        let detection_table = self.snapshot().map_err(block)?;
-        let game = Self::recognize(&rules, self.owners.as_mut(), &detection_table, &target)
-            .map_err(|text| block(BlockReason::AmbiguousOwner(text)))?
-            .ok_or_else(|| block(BlockReason::NotAGame))?;
+        // One suspension asks X11 at most once per (app id, title), and not
+        // again after a lookup failed.
+        let mut lookups = LookupCache::default();
+        let by_rule = rules.recognize(target.app_id.as_deref(), target.title.as_deref());
+        let game = if let Some(game) = by_rule {
+            game
+        } else {
+            // Only detection needs a snapshot before discovery.
+            let detection_table = self.snapshot().map_err(block)?;
+            let mut owners = lookups.over(self.owners.as_mut());
+            Self::detected(&mut owners, &detection_table, &target)
+                .map_err(|why| block(BlockReason::NotAGame(Some(why))))?
+                .ok_or_else(|| block(BlockReason::NotAGame(None)))?
+        };
         // Steps 3–5: discover, check, separate, check the units.
         let (table, set) = self.separate(&game.identity).map_err(block)?;
         let units = self.target_units(&table, &set).map_err(block)?;
@@ -639,9 +687,15 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
             let same_game = in_set
                 || window.id == id
                 || (window.app_id == target.app_id
-                    && Self::recognize(&rules, self.owners.as_mut(), &table, window)
-                        .ok()
-                        .flatten()
+                    && rules
+                        .recognize(window.app_id.as_deref(), window.title.as_deref())
+                        .map_or_else(
+                            || {
+                                let mut owners = lookups.over(self.owners.as_mut());
+                                Self::detected(&mut owners, &table, window).ok().flatten()
+                            },
+                            Some,
+                        )
                         .is_some_and(|other| other.identity == game.identity));
             if same_game {
                 game_windows.insert(window.id);
@@ -1011,6 +1065,8 @@ mod tests {
         windows: Vec<WindowView>,
         /// States `freezer_state` reports, one per call, before the stored ones.
         reports: Vec<FreezerState>,
+        /// How many `/proc` snapshots were taken.
+        snapshots: usize,
     }
 
     /// What the fake X server answers, shared with the fixture.
@@ -1018,6 +1074,8 @@ mod tests {
     struct XServer {
         /// `None` means no lookup is possible, else the owner pids of the matching windows.
         owners: Option<Vec<u32>>,
+        /// Answers for particular titles, before `owners`: an error text or owner pids.
+        by_title: BTreeMap<String, Result<Vec<u32>, String>>,
         /// `(app_id, title)` of every lookup made.
         calls: Vec<(String, String)>,
     }
@@ -1030,11 +1088,17 @@ mod tests {
     struct FakeOwners(Arc<Mutex<XServer>>);
 
     impl WindowOwners for FakeOwners {
-        fn owner(&mut self, app_id: &str, title: &str) -> Option<OwnerLookup> {
+        fn owner(&mut self, app_id: &str, title: &str) -> Result<OwnerLookup, String> {
             let mut server = self.0.lock().unwrap();
             server.calls.push((app_id.into(), title.into()));
-            let pids = server.owners.clone()?;
-            Some(match pids.as_slice() {
+            let pids = match server.by_title.get(title) {
+                Some(answer) => answer.clone()?,
+                None => server
+                    .owners
+                    .clone()
+                    .ok_or_else(|| "no local X11 display".to_owned())?,
+            };
+            Ok(match pids.as_slice() {
                 [] => OwnerLookup::NoMatch,
                 [pid] => OwnerLookup::Owner(*pid),
                 _ => OwnerLookup::Ambiguous(pids),
@@ -1134,9 +1198,9 @@ mod tests {
 
     impl ProcessSource for FakeProcesses {
         fn snapshot(&self) -> io::Result<ProcessTable> {
-            Ok(ProcessTable::new(
-                self.0.borrow().processes.values().cloned(),
-            ))
+            let mut world = self.0.borrow_mut();
+            world.snapshots += 1;
+            Ok(ProcessTable::new(world.processes.values().cloned()))
         }
     }
 
@@ -1300,7 +1364,7 @@ mod tests {
             let world = Rc::new(RefCell::new(world));
             let xserver = Arc::new(Mutex::new(XServer {
                 owners,
-                calls: Vec::new(),
+                ..XServer::default()
             }));
             let standby = Standby::new(
                 FakeSystemd(world.clone()),
@@ -1374,6 +1438,13 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o755));
             let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn blocked_text(outcome: &StandbyOutcome) -> String {
+        match outcome {
+            StandbyOutcome::Blocked { reason, .. } => reason.describe(),
+            other => panic!("expected a block, got {other:?}"),
         }
     }
 
@@ -1571,6 +1642,163 @@ mod tests {
         assert_eq!(f.suspended_windows(), vec![608, 609]);
         // One lookup for the target, one for the other window with its app id.
         assert_eq!(f.owner_calls().len(), 2);
+    }
+
+    /// Victoria's world with more `steam_proton` windows of the satellite.
+    fn victoria_with_x11_windows(titles: &[(u64, &str)]) -> World {
+        let mut world = victoria_world();
+        make_wine(&mut world, 4242);
+        for (id, title) in titles {
+            world
+                .windows
+                .push(window(*id, "steam_proton", title, 2000, false));
+        }
+        world
+    }
+
+    #[test]
+    fn sibling_lookups_stop_after_the_first_error() {
+        let world = victoria_with_x11_windows(&[(609, "A"), (610, "B"), (611, "C")]);
+        let mut f = Fixture::with_owners("detect-sibling-error", None, world, Some(vec![4242]));
+        f.xserver
+            .lock()
+            .unwrap()
+            .by_title
+            .insert("A".into(), Err("X11 socket error: broken pipe".into()));
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, Some(608));
+        assert!(
+            matches!(outcome, StandbyOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        // The target, then the first sibling, whose error ends the lookups.
+        assert_eq!(
+            f.owner_calls(),
+            vec![
+                ("steam_proton".to_owned(), "Victoria 3".to_owned()),
+                ("steam_proton".to_owned(), "A".to_owned()),
+            ]
+        );
+        assert_eq!(f.suspended_windows(), vec![608]);
+    }
+
+    #[test]
+    fn siblings_with_the_same_title_cost_one_lookup() {
+        let world = victoria_with_x11_windows(&[(609, "Default IME"), (610, "Default IME")]);
+        let mut f = Fixture::with_owners("detect-sibling-cache", None, world, Some(vec![4242]));
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, Some(608));
+        assert!(
+            matches!(outcome, StandbyOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            f.owner_calls(),
+            vec![
+                ("steam_proton".to_owned(), "Victoria 3".to_owned()),
+                ("steam_proton".to_owned(), "Default IME".to_owned()),
+            ]
+        );
+        assert_eq!(f.suspended_windows(), vec![608, 609, 610]);
+    }
+
+    #[test]
+    fn siblings_without_a_single_game_owner_are_not_flagged() {
+        let world =
+            victoria_with_x11_windows(&[(609, "nobody"), (610, "two owners"), (611, "broken")]);
+        let mut f = Fixture::with_owners("detect-sibling-unknown", None, world, Some(vec![4242]));
+        {
+            let mut server = f.xserver.lock().unwrap();
+            server.by_title.insert("nobody".into(), Ok(Vec::new()));
+            server
+                .by_title
+                .insert("two owners".into(), Ok(vec![4242, 4243]));
+            server
+                .by_title
+                .insert("broken".into(), Err("X11 protocol error".into()));
+        }
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, Some(608));
+        assert!(
+            matches!(outcome, StandbyOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(f.owner_calls().len(), 4);
+        assert_eq!(f.suspended_windows(), vec![608]);
+    }
+
+    #[test]
+    fn a_window_with_another_app_id_is_never_looked_up() {
+        let mut world = victoria_world();
+        make_wine(&mut world, 4242);
+        world
+            .windows
+            .push(window(609, "steam_app_9", "Victoria 3", 2000, false));
+        let mut f = Fixture::with_owners("detect-other-app-id", None, world, Some(vec![4242]));
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, Some(608));
+        assert!(
+            matches!(outcome, StandbyOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            f.owner_calls(),
+            vec![("steam_proton".to_owned(), "Victoria 3".to_owned())]
+        );
+        assert_eq!(f.suspended_windows(), vec![608]);
+    }
+
+    #[test]
+    fn an_x11_owner_with_only_wineprefix_is_not_a_game() {
+        // Floorp carries the session's WINEPREFIX but no WINESERVERSOCKET.
+        let mut f = Fixture::with_owners(
+            "detect-wineprefix",
+            None,
+            victoria_world(),
+            Some(vec![5500]),
+        );
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        assert_eq!(blocked_code(&outcome), "not_a_game");
+        assert_eq!(
+            blocked_text(&outcome),
+            "the window is not a recognized game: \
+             process 5500 (floorp) has neither SteamAppId nor WINESERVERSOCKET"
+        );
+        assert!(f.changes().is_empty());
+    }
+
+    #[test]
+    fn a_failed_x11_lookup_is_named_in_the_refusal() {
+        let mut world = victoria_world();
+        make_wine(&mut world, 4242);
+        let mut f = Fixture::with_owners("detect-x11-error", None, world, None);
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        assert_eq!(
+            blocked_text(&outcome),
+            "the window is not a recognized game: X11 lookup failed: no local X11 display"
+        );
+    }
+
+    #[test]
+    fn a_rule_match_takes_no_detection_snapshot() {
+        // Discovery alone: one snapshot, one to confirm the move, one more
+        // discovery that finds nothing outside.
+        let mut f = Fixture::victoria("rule-snapshots");
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        assert_victoria_suspended(&f, &outcome);
+        assert_eq!(f.world.borrow().snapshots, 3);
+
+        // Detection adds its own snapshot before discovery.
+        let mut world = victoria_world();
+        make_wine(&mut world, 4242);
+        let mut f = Fixture::with_owners("detect-snapshots", None, world, Some(vec![4242]));
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        assert_victoria_suspended(&f, &outcome);
+        assert_eq!(f.world.borrow().snapshots, 4);
     }
 
     #[test]
@@ -2387,8 +2615,8 @@ mod tests {
     #[test]
     fn block_reasons_have_stable_codes() {
         let reasons = [
-            (BlockReason::NotAGame, "not_a_game"),
-            (BlockReason::AmbiguousOwner("x".into()), "not_a_game"),
+            (BlockReason::NotAGame(None), "not_a_game"),
+            (BlockReason::NotAGame(Some("x".into())), "not_a_game"),
             (BlockReason::GameNotRunning, "game_not_running"),
             (
                 BlockReason::ProtectedProcess {
@@ -2418,7 +2646,7 @@ mod tests {
         let blocked = outcome_result(&StandbyOutcome::Blocked {
             operation: StandbyOperation::Suspend,
             window_id: Some(7),
-            reason: BlockReason::NotAGame,
+            reason: BlockReason::NotAGame(None),
         });
         assert_eq!(blocked.operation, Operation::Suspend);
         assert_eq!(blocked.status, ActionStatus::Blocked);
