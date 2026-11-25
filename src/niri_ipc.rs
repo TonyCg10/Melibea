@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::{
     attention::Proportion,
-    niri::{NiriEvent, NiriEventError, parse_event_line},
+    niri::{NiriEvent, NiriEventError, NiriMinimizedWindowInfo, NiriWindow, parse_event_line},
     protocol::WindowTransition,
     transition::WindowId,
 };
@@ -294,6 +294,46 @@ impl NiriActionClient {
         )
     }
 
+    /// Lists the windows that niri holds on visible workspaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when socket I/O fails, niri rejects the request, or the
+    /// reply is not a `Windows` list.
+    pub fn windows(&mut self) -> Result<Vec<NiriWindow>, NiriActionError> {
+        self.send_query(&QueryRequest::Windows, "Windows")
+    }
+
+    /// Lists the windows that niri holds outside visible workspaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when socket I/O fails, niri rejects the request, or the
+    /// reply is not a `MinimizedWindows` list.
+    pub fn minimized_windows(&mut self) -> Result<Vec<NiriMinimizedWindowInfo>, NiriActionError> {
+        self.send_query(&QueryRequest::MinimizedWindows, "MinimizedWindows")
+    }
+
+    /// Asks niri to suspend or resume a window, which keeps its layout place.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when serialization, socket I/O, or niri rejects the
+    /// action.
+    pub fn set_window_suspended(
+        &mut self,
+        window_id: WindowId,
+        suspended: bool,
+    ) -> Result<NiriWindowActionResult, NiriActionError> {
+        self.send_window_action(
+            NiriAction::SetWindowSuspended {
+                id: window_id.0,
+                suspended,
+            },
+            Some(window_id.0),
+        )
+    }
+
     fn send_window_action(
         &mut self,
         action: NiriAction,
@@ -311,8 +351,22 @@ impl NiriActionClient {
     }
 
     fn send_action(&mut self, action: NiriAction) -> Result<ActionReply, NiriActionError> {
-        let request = ActionRequest::Action(action);
-        let mut line = serde_json::to_string(&request).map_err(NiriActionError::Serialize)?;
+        let line = self.exchange(&ActionRequest::Action(action))?;
+        validate_action_reply(&line)
+    }
+
+    fn send_query<T: serde::de::DeserializeOwned>(
+        &mut self,
+        request: &QueryRequest,
+        variant: &str,
+    ) -> Result<T, NiriActionError> {
+        let line = self.exchange(request)?;
+        validate_query_reply(&line, variant)
+    }
+
+    /// Writes one request line and returns the single reply line niri sends back.
+    fn exchange(&mut self, request: &impl Serialize) -> Result<String, NiriActionError> {
+        let mut line = serde_json::to_string(request).map_err(NiriActionError::Serialize)?;
         line.push('\n');
         self.reader
             .get_mut()
@@ -323,16 +377,15 @@ impl NiriActionClient {
             .flush()
             .map_err(NiriActionError::WriteRequest)?;
 
-        line.clear();
+        let mut reply = String::new();
         let bytes = self
             .reader
-            .read_line(&mut line)
+            .read_line(&mut reply)
             .map_err(NiriActionError::ReadReply)?;
         if bytes == 0 {
             return Err(NiriActionError::ClosedBeforeReply);
         }
-
-        validate_action_reply(&line)
+        Ok(reply)
     }
 }
 
@@ -386,11 +439,45 @@ enum NiriAction {
         #[serde(skip_serializing_if = "Option::is_none")]
         transition: Option<WindowTransition>,
     },
+    SetWindowSuspended {
+        id: u64,
+        suspended: bool,
+    },
+}
+
+/// Unit requests that niri answers with a named list.
+#[derive(Serialize)]
+enum QueryRequest {
+    Windows,
+    MinimizedWindows,
 }
 
 #[derive(Serialize)]
 enum SizeChange {
     SetProportion(f64),
+}
+
+fn validate_query_reply<T: serde::de::DeserializeOwned>(
+    line: &str,
+    variant: &str,
+) -> Result<T, NiriActionError> {
+    let reply: Value = serde_json::from_str(line).map_err(NiriActionError::InvalidReply)?;
+
+    match reply {
+        Value::Object(object) if object.len() == 1 => match object.into_iter().next() {
+            Some((name, Value::Object(mut response))) if name == "Ok" && response.len() == 1 => {
+                let Some(payload) = response.remove(variant) else {
+                    return Err(NiriActionError::UnexpectedReply);
+                };
+                serde_json::from_value(payload).map_err(|_| NiriActionError::UnexpectedReply)
+            }
+            Some((name, Value::String(message))) if name == "Err" => {
+                Err(NiriActionError::RequestRejected(message))
+            }
+            _ => Err(NiriActionError::UnexpectedReply),
+        },
+        _ => Err(NiriActionError::UnexpectedReply),
+    }
 }
 
 fn validate_action_reply(line: &str) -> Result<ActionReply, NiriActionError> {
@@ -584,7 +671,7 @@ mod tests {
     };
     use crate::{
         attention::{Proportion, WidthPolicy},
-        niri::NiriEvent,
+        niri::{NiriEvent, NiriMinimizedWindowInfo},
         protocol::{BubbleAnchor, WindowTransition},
         transition::WindowId,
     };
@@ -843,6 +930,72 @@ mod tests {
             result.expect("semantic result").status,
             NiriWindowActionStatus::WindowNotFound
         );
+    }
+
+    #[test]
+    fn set_window_suspended_sends_the_fork_action() {
+        let (result, request) = send_action_to_server(
+            b"{\"Ok\":{\"WindowActionResult\":{\"requested_id\":7,\"window_id\":7,\"status\":\"Applied\"}}}\n",
+            |client| client.set_window_suspended(WindowId(7), true),
+        );
+        assert_eq!(
+            result.expect("accepted action").status,
+            NiriWindowActionStatus::Applied
+        );
+        let actual: serde_json::Value = serde_json::from_str(&request).expect("action JSON");
+        assert_eq!(
+            actual,
+            serde_json::json!({"Action":{"SetWindowSuspended":{"id":7,"suspended":true}}})
+        );
+    }
+
+    #[test]
+    fn windows_reads_pid_and_suspended_flag() {
+        let (result, request) = send_action_to_server(
+            b"{\"Ok\":{\"Windows\":[{\"id\":1,\"title\":null,\"app_id\":\"kitty\",\"pid\":42,\"is_focused\":true,\"is_floating\":false,\"is_suspended\":true},{\"id\":2,\"title\":null,\"app_id\":null,\"is_focused\":false,\"is_floating\":false}]}}\n",
+            NiriActionClient::windows,
+        );
+        let windows = result.expect("windows");
+        assert_eq!(request, "\"Windows\"\n");
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].pid, Some(42));
+        assert!(windows[0].is_suspended);
+        assert_eq!(windows[1].pid, None);
+        assert!(!windows[1].is_suspended);
+    }
+
+    #[test]
+    fn minimized_windows_reads_the_records() {
+        let (result, request) = send_action_to_server(
+            b"{\"Ok\":{\"MinimizedWindows\":[{\"id\":9,\"title\":\"scratch\",\"app_id\":\"kitty\",\"pid\":77,\"is_urgent\":false,\"focus_timestamp\":null,\"is_suspended\":true}]}}\n",
+            NiriActionClient::minimized_windows,
+        );
+        assert_eq!(request, "\"MinimizedWindows\"\n");
+        assert_eq!(
+            result.expect("minimized windows"),
+            vec![NiriMinimizedWindowInfo {
+                id: 9,
+                title: Some("scratch".to_owned()),
+                app_id: Some("kitty".to_owned()),
+                pid: Some(77),
+                is_suspended: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn window_queries_report_rejections_and_unexpected_shapes() {
+        let (result, _) = send_action_to_server(b"{\"Err\":\"busy\"}\n", NiriActionClient::windows);
+        assert!(matches!(
+            result,
+            Err(NiriActionError::RequestRejected(message)) if message == "busy"
+        ));
+
+        let (result, _) =
+            send_action_to_server(b"{\"Ok\":{\"MinimizedWindows\":[]}}\n", |client| {
+                client.windows()
+            });
+        assert!(matches!(result, Err(NiriActionError::UnexpectedReply)));
     }
 
     #[test]

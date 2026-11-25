@@ -20,8 +20,25 @@ pub struct NiriWindow {
     pub id: u64,
     pub title: Option<String>,
     pub app_id: Option<String>,
+    /// Process that created the window's Wayland connection, when niri knows it.
+    #[serde(default)]
+    pub pid: Option<i32>,
     pub is_focused: bool,
     pub is_floating: bool,
+    /// Whether the compositor has suspended the window; absent on older niri.
+    #[serde(default)]
+    pub is_suspended: bool,
+}
+
+/// A window held outside visible workspaces, as niri's `MinimizedWindows` reply reports it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct NiriMinimizedWindowInfo {
+    pub id: u64,
+    pub title: Option<String>,
+    pub app_id: Option<String>,
+    pub pid: Option<i32>,
+    #[serde(default)]
+    pub is_suspended: bool,
 }
 
 impl NiriWindow {
@@ -409,6 +426,20 @@ mod tests {
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].id, 7);
         assert_eq!(windows[0].app_id.as_deref(), Some("kitty"));
+    }
+
+    #[test]
+    fn windows_changed_without_pid_or_suspended_flag_still_parses() {
+        let event = parse_event_line(
+            r#"{"WindowsChanged":{"windows":[{"id":7,"title":"t","app_id":"kitty","is_focused":true,"is_floating":false}]}}"#,
+        )
+        .expect("valid event without the new fields");
+
+        let NiriEvent::WindowsChanged { windows } = event else {
+            panic!("expected window snapshot")
+        };
+        assert_eq!(windows[0].pid, None);
+        assert!(!windows[0].is_suspended);
     }
 
     #[test]

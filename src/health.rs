@@ -142,8 +142,10 @@ mod tests {
             id,
             title: Some("title".to_owned()),
             app_id: Some(app_id.to_owned()),
+            pid: None,
             is_focused: focused,
             is_floating: floating,
+            is_suspended: false,
         }
     }
 
