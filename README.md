@@ -137,6 +137,5 @@ authoritative close revision.
 See [PROTOCOL.md](PROTOCOL.md) for the frozen v1 wire contract and
 [PROTOCOL-V2.md](PROTOCOL-V2.md) for the action-scoped motion extension,
 [PROJECT.md](PROJECT.md) for product boundaries, and [ROADMAP.md](ROADMAP.md)
-for the active milestone. Work paused during the final M7 integration is
-recorded in [M7-HANDOFF.md](M7-HANDOFF.md); a new session should read that file
-before applying patches or touching the live compositor.
+for the active milestone. Agents start with [AGENTS.md](AGENTS.md); completed
+milestones and the superseded M7 hand-off are in [docs/history](docs/history/).
