@@ -17,7 +17,7 @@ M0 Foundation (done)
       -> M6 Celestina bubble integration (complete)
       -> M7 Coordinated bubble motion (complete, one criterion deferred)
       -> M8 Optional expansions
-      -> M12 Standby (proposed)
+      -> M12 Standby (designed; awaiting the author's decisions)
   -> M9 Screen magnifier (complete, in the Niri fork)
       -> M10 Screen ruler companion binary (built; awaiting real-session check)
   -> M11 Binding modes (complete, in the Niri fork)
@@ -265,9 +265,14 @@ does not live here.
 
 ## M12 — Standby
 
-**Status:** proposed 2026-11-17; design awaiting the author's decisions
+**Status:** designed 2026-11-17, not started. Four open decisions in the design
+wait for the author, the last of them when M12 may become the active milestone.
+No plan and no code yet.
 
 **Design:** [docs/superpowers/specs/2026-11-17-melibea-standby-design.md](docs/superpowers/specs/2026-11-17-melibea-standby-design.md)
+
+**Estimated effort:** not estimated; the validation spike comes first, as M3
+came before M4, and sizes the rest.
 
 ### Outcome
 
@@ -293,13 +298,25 @@ past a configured delay.
 
 - The console-style game application and any drawing of application identity;
   they consume protocol v3 from outside these repositories.
-- Saving process state to disk.
+- Saving process state to disk, or resuming after a reboot.
+- Suspending without the user asking, such as for battery or thermal policy.
+
+### Exit
+
+- The suspend bind freezes the focused eligible window, shows it blurred, and
+  the resume bind wakes it with its state intact.
+- Standby after minimizing works for opted-in applications only.
+- With no binds and no `[[standby]]` rules, behavior and protocol v1/v2 output
+  are unchanged byte for byte.
+- No request can freeze niri, Melibea, the shell, `xwayland-satellite`, or a
+  unit with a window that is not being suspended; every refusal is explained.
+- No frozen unit survives Melibea stopping, crashing or restarting.
 
 ## Where the Niri fork lives
 
-M4, M7, M9, M11 and part of M12 are code in the Niri fork, not in this repository. The fork
-is GPL-3.0, like niri, and is kept as its own repository rather than inside
-this MIT one: <https://github.com/TonyCg10/niri-melibea>, branch `main`, on
+M4, M7, M9 and M11, and the rendering and input part of M12, are code in the
+Niri fork, not in this repository. The fork is GPL-3.0, like niri, and is kept
+as its own repository rather than inside this MIT one: <https://github.com/TonyCg10/niri-melibea>, branch `main`, on
 top of upstream niri `8ed0da4`.
 
 Until 2026-09-23 its only remote was a directory under `/tmp` that had already

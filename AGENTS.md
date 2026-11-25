@@ -35,8 +35,9 @@ Read when the trigger applies, before acting on that matter:
 - Native minimization takes a window out of layout and navigation; a hidden
   workspace or off-screen scratchpad is not a substitute.
 - State changes never wait for an animation to finish.
-- Code that changes niri itself (M4, M7, M9, M11) belongs in the fork at
-  `../NIRI-MELIBEA`, a separate GPL-3.0 repository, not here.
+- Code that changes niri itself (M4, M7, M9, M11, and M12's suspended-window
+  flag) belongs in the fork at `../NIRI-MELIBEA`, a separate GPL-3.0
+  repository, not here.
 
 ## Checks
 

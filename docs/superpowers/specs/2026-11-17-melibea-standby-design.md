@@ -257,5 +257,7 @@ A spike in a disposable nested niri before daemon integration, as in M3:
    one (icon and name) from protocol v3, or nothing until the game app.
 3. **Steam games.** Refuse, or allow freezing Steam's whole unit as an explicit
    opt-in.
-4. **Milestone order.** M10 (the ruler) is planned and not started, and the
-   roadmap keeps one active milestone.
+4. **Milestone order.** The roadmap keeps one active implementation milestone.
+   When this design was merged into `main`, M1 was a deployed trial under
+   observation and M10 (the ruler) was built and awaiting the author's
+   real-session check.
