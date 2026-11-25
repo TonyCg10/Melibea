@@ -6,3 +6,4 @@ pub mod ledger;
 pub mod process;
 pub mod systemd;
 pub mod timers;
+pub mod x11;
