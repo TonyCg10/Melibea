@@ -16,6 +16,8 @@ use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Bound on connecting plus one whole lookup.
@@ -233,8 +235,20 @@ impl X11Client {
         cookie: Option<&[u8]>,
         timeout: Duration,
     ) -> Result<Self, X11Error> {
+        let socket = socket.to_path_buf();
+        Self::connect_via(move || UnixStream::connect(socket), cookie, timeout)
+    }
+
+    /// [`X11Client::connect`] with the socket opened by `open`, which runs on
+    /// a helper thread so that a blocking connect (a server whose listen
+    /// backlog is full) shares the deadline. On expiry the helper is left to
+    /// finish on its own and drops whatever stream it gets.
+    fn connect_via<F>(open: F, cookie: Option<&[u8]>, timeout: Duration) -> Result<Self, X11Error>
+    where
+        F: FnOnce() -> io::Result<UnixStream> + Send + 'static,
+    {
         let deadline = deadline_after(timeout);
-        let stream = UnixStream::connect(socket).map_err(X11Error::Io)?;
+        let stream = open_within(open, deadline)?;
         let mut client = Self {
             stream,
             timeout,
@@ -596,6 +610,31 @@ fn deadline_after(timeout: Duration) -> Instant {
     now.checked_add(timeout)
         .or_else(|| now.checked_add(Duration::from_hours(100 * 365 * 24)))
         .unwrap_or(now)
+}
+
+/// Runs `open` on a helper thread and waits for it until `deadline`.
+fn open_within<F>(open: F, deadline: Instant) -> Result<UnixStream, X11Error>
+where
+    F: FnOnce() -> io::Result<UnixStream> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("melibea-x11-connect".to_string())
+        .spawn(move || {
+            // The receiver is gone after a timeout; the stream is then dropped.
+            let _ = sender.send(open());
+        })
+        .map_err(X11Error::Io)?;
+    let left = deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or_default();
+    match receiver.recv_timeout(left) {
+        Ok(result) => result.map_err(X11Error::Io),
+        Err(RecvTimeoutError::Timeout) => Err(X11Error::Timeout),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err(protocol("the connecting thread ended without an answer"))
+        }
+    }
 }
 
 fn x_error(opcode: u8, code: u8) -> X11Error {
@@ -1426,6 +1465,56 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("melibea-x11-missing-{}", std::process::id()));
         let result = X11Client::connect(&dir.join("X0"), None, Duration::from_millis(200));
         assert!(matches!(result, Err(X11Error::Io(_))), "{result:?}");
+    }
+
+    #[test]
+    fn a_connect_that_blocks_times_out() {
+        // Stands in for a listener whose backlog is full: the connect itself
+        // never returns within the deadline.
+        let fake = spawn("blocked-connect", script(victoria_windows()));
+        let socket = fake.socket.clone();
+        let start = Instant::now();
+        let result = X11Client::connect_via(
+            move || {
+                thread::sleep(Duration::from_secs(2));
+                UnixStream::connect(socket)
+            },
+            None,
+            Duration::from_millis(200),
+        );
+        assert!(matches!(result, Err(X11Error::Timeout)), "{result:?}");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            start.elapsed()
+        );
+        drop(fake);
+    }
+
+    #[test]
+    fn a_slow_connect_shares_the_deadline() {
+        // The connect returns in time but uses most of the budget; the
+        // trickling setup must still end at the one deadline.
+        let mut s = script(Vec::new());
+        s.fault = Fault::Trickle;
+        let fake = spawn("slow-connect", s);
+        let socket = fake.socket.clone();
+        let start = Instant::now();
+        let result = X11Client::connect_via(
+            move || {
+                thread::sleep(Duration::from_millis(150));
+                UnixStream::connect(socket)
+            },
+            None,
+            Duration::from_millis(200),
+        );
+        assert!(matches!(result, Err(X11Error::Timeout)), "{result:?}");
+        assert!(
+            start.elapsed() < Duration::from_millis(350),
+            "{:?}",
+            start.elapsed()
+        );
+        fake.finish();
     }
 
     #[test]
