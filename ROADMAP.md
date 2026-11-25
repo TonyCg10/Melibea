@@ -17,7 +17,7 @@ M0 Foundation (done)
       -> M6 Celestina bubble integration (complete)
       -> M7 Coordinated bubble motion (complete, one criterion deferred)
       -> M8 Optional expansions
-      -> M12 Standby for games (active; spike first)
+      -> M12 Standby for games (built, in daily use)
   -> M9 Screen magnifier (complete, in the Niri fork)
       -> M10 Screen ruler companion binary (built; awaiting real-session check)
   -> M11 Binding modes (complete, in the Niri fork)
@@ -265,9 +265,8 @@ does not live here.
 
 ## M12 — Standby
 
-**Status:** active since 2026-11-24, narrowed to games. Not started: the
-validation spike (plan task 1) comes first and gates the rest. M10 stays
-awaiting its real-session check meanwhile.
+**Status:** built and in daily use since 2026-11-25; two checks remain (see
+"Real session" below). Fork `f3219392`, Melibea `cbc4069`, both installed.
 
 **Design:** [docs/superpowers/specs/2026-11-17-melibea-standby-design.md](docs/superpowers/specs/2026-11-17-melibea-standby-design.md)
 
@@ -302,6 +301,28 @@ and `systemctl --user freeze|thaw`, on systemd 262 with cgroup v2:
   after the thaw, and Steam registered its exit.
 
 The gate passed: moving a game's processes out of a Flatpak unit works.
+
+### Real session
+
+Checked by the author on 2026-11-25 with the installed fork and daemon, no
+`games.toml`, bind `Mod+B` then `S` (the `bubbles` binding mode):
+
+- Victoria 3 (Bottles, Proton-CachyOS) recognized without a rule: the X server
+  named `victoria3.exe` (host pid) as the window's owner and its environment
+  carries `WINESERVERSOCKET`. Only that process moved into
+  `app-melibea-game-<pid>.scope` and froze (CPU flat); Bottles kept running.
+  The window showed blurred and dimmed, clicks and typing on it never reached
+  the game, and the second press resumed it intact.
+- A Steam game suspended and resumed the same way, by the author's report.
+- The bind on a window that is not a game did nothing.
+- `systemctl --user restart melibea.service` with the game frozen: the unit's
+  `ExecStopPost` ran `thaw-all`, which thawed the scope, cleared the flag and
+  emptied the ledger.
+
+Not yet checked live: restoring from Celestina a minimized game that Melibea
+froze, and `standby_after`. The nested end-to-end run (task 13 step 1) covered
+restart reconciliation, `kill -9` plus `thaw-all`, and the compositor exiting
+with a game frozen.
 
 ### Outcome
 
