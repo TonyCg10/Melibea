@@ -67,6 +67,9 @@ A window is a game when, checked in this order:
 1. A rule in `$XDG_CONFIG_HOME/melibea/games.toml` matches it. Rules are
    resolved top to bottom, first match wins, like `[[attention]]`.
 2. Otherwise, its app id is `steam_app_<N>` with `N` a decimal Steam app id.
+3. Otherwise, the process that owns the window is a game by its own
+   environment (see [Recognizing a game without rules](#recognizing-a-game-without-rules)).
+   Most games need no rule at all.
 
 ```toml
 [[game]]
@@ -100,8 +103,47 @@ The **game set** is those processes and all their descendants. The
 process name, or same Steam app id) plus every window whose pid is in the game
 set; they are suspended and resumed together.
 
-A missing `games.toml` means no rules; Steam games still work. An invalid one
-refuses suspension with the parse error and never affects resume or recovery.
+A missing `games.toml` means no rules; Steam, Wine and Proton games still work.
+An invalid one refuses suspension with the parse error and never affects
+resume or recovery.
+
+### Recognizing a game without rules
+
+Added 2026-11-25 after the author asked to stop writing a rule per game, and
+measured the same day on Victoria 3 under Bottles.
+
+**Finding the process that owns the window.**
+
+- A native Wayland window: niri's `pid`.
+- An X11 window: niri reports the pid of `xwayland-satellite`, so Melibea asks
+  the X server instead. It connects to `$DISPLAY` (a Unix socket
+  `/tmp/.X11-unix/X<n>`, MIT-MAGIC-COOKIE-1 from `$XAUTHORITY` when present,
+  no authorization otherwise), and lists the root's children.
+- It keeps those whose `WM_CLASS` instance or class equals niri's app id and
+  whose `_NET_WM_NAME` (else `WM_NAME`) equals niri's title.
+- For each, it asks the X-Resource extension (`XResQueryClientIds`,
+  `LocalClientPID`) for the pid of the client that owns it. This is the
+  **host** pid even inside a Flatpak sandbox, whereas `_NET_WM_PID` is the
+  sandbox's own (Victoria 3: 90994 against 6413).
+- Exactly one distinct pid must remain. None or several recognizes nothing,
+  never a guess.
+- Melibea speaks this small part of the X11 protocol itself, as it does with
+  niri: no new dependency. Every read is bounded in time and size.
+
+**Deciding it is a game**, from that process's environment:
+
+- `SteamAppId=<N>`: a Steam game, identity `SteamApp { N }`, native or Proton.
+- `WINESERVERSOCKET`: a Wine or Proton process (Bottles, Lutris, Heroic,
+  plain Wine), identity `Process { name }` with the basename of its
+  `argv[0]`. The session exports `WINEPREFIX` to unrelated programs, so it is
+  not a marker.
+- Otherwise not a game.
+
+**Then** the game set, separation and the safety rule apply unchanged. The
+owner's pid is only how the identity is found.
+
+Rules still override this: a matching rule is applied first. They remain for
+native non-Steam games and for `standby_after`.
 
 ## Separating the game
 
