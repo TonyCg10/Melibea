@@ -17,7 +17,7 @@ M0 Foundation (done)
       -> M6 Celestina bubble integration (complete)
       -> M7 Coordinated bubble motion (complete, one criterion deferred)
       -> M8 Optional expansions
-      -> M12 Standby (designed; awaiting the author's decisions)
+      -> M12 Standby for games (active; spike first)
   -> M9 Screen magnifier (complete, in the Niri fork)
       -> M10 Screen ruler companion binary (built; awaiting real-session check)
   -> M11 Binding modes (complete, in the Niri fork)
@@ -265,51 +265,61 @@ does not live here.
 
 ## M12 — Standby
 
-**Status:** designed 2026-11-17, not started. Four open decisions in the design
-wait for the author, the last of them when M12 may become the active milestone.
-No plan and no code yet.
+**Status:** active since 2026-11-24, narrowed to games. Not started: the
+validation spike (plan task 1) comes first and gates the rest. M10 stays
+awaiting its real-session check meanwhile.
 
 **Design:** [docs/superpowers/specs/2026-11-17-melibea-standby-design.md](docs/superpowers/specs/2026-11-17-melibea-standby-design.md)
 
-**Estimated effort:** not estimated; the validation spike comes first, as M3
-came before M4, and sizes the rest.
+**Plan:** [docs/superpowers/plans/2026-11-24-melibea-standby.md](docs/superpowers/plans/2026-11-24-melibea-standby.md)
+
+**Estimated effort:** not estimated; the spike comes first, as M3 came before
+M4, and sizes the rest.
 
 ### Outcome
 
-A bind suspends the focused window like a console suspends a game: its
-systemd unit is frozen with the cgroup v2 freezer, and niri keeps its last
-frame on screen, blurred, without delivering input, until the window is
-resumed. Opted-in applications are also suspended after staying minimized
-past a configured delay.
+A bind toggles the focused game like a console suspends one: Melibea moves the
+game's processes into a systemd scope of their own and freezes only that with
+the cgroup v2 freezer, and niri keeps the window's last frame on screen,
+blurred and dimmed, without delivering input, until the next press. Bottles,
+the Wine server of its prefix and the Steam client keep running. A game whose
+rule names a delay is also suspended after staying minimized that long.
 
 ### In
 
-- `suspend` and `resume` in Melibea, bound through niri `spawn`.
-- `[[standby]]` rules with an explicit delay for minimized windows.
+- `toggle-suspend`, `suspend` and `resume` in Melibea, bound through niri
+  `spawn`.
+- Game recognition: Steam games by `steam_app_<N>` and `SteamAppId`, other
+  games by `[[game]]` rules in `games.toml` naming their process.
+- Separating the game into `app-melibea-game-<pid>.scope` before freezing.
 - A safety rule, checked from `/proc`, that never freezes niri, Melibea, the
-  shell, `xwayland-satellite`, or a unit with a window not being suspended.
-- A ledger, start-up reconciliation and `thaw-all` from `ExecStopPost`.
-- Protocol v3: suspend and resume actions, unit registration for launchers,
-  and an ordered suspended-window list.
-- In the Niri fork: a per-window suspended flag rendered with the existing
-  blur, input exclusion, and `is_suspended` in IPC.
+  shell, `xwayland-satellite`, or a process outside the game.
+- A ledger, reconciliation and `thaw-all` from `ExecStopPost`.
+- Protocol v3: suspend, resume and toggle actions and an ordered
+  suspended-window list.
+- In the Niri fork: a per-window suspended flag rendered blurred and dimmed,
+  input and focus exclusion, and `is_suspended` in IPC.
 
 ### Out
 
-- The console-style game application and any drawing of application identity;
-  they consume protocol v3 from outside these repositories.
+- Suspending applications that are not games.
+- The console-style game application, `register_unit` and any drawing of
+  application identity; they consume protocol v3 from outside these
+  repositories.
 - Saving process state to disk, or resuming after a reboot.
 - Suspending without the user asking, such as for battery or thermal policy.
 
 ### Exit
 
-- The suspend bind freezes the focused eligible window, shows it blurred, and
-  the resume bind wakes it with its state intact.
-- Standby after minimizing works for opted-in applications only.
-- With no binds and no `[[standby]]` rules, behavior and protocol v1/v2 output
-  are unchanged byte for byte.
+- The toggle bind freezes the focused game, shows it blurred, and the next
+  press wakes it with its state intact, for a Bottles game and a Steam game.
+- Only the game freezes: Bottles, the prefix's Wine server and the Steam
+  client keep running.
+- Standby after minimizing works for games whose rule names a delay only.
+- With no bind pressed and no `standby_after`, behavior and protocol v1/v2
+  output are unchanged byte for byte.
 - No request can freeze niri, Melibea, the shell, `xwayland-satellite`, or a
-  unit with a window that is not being suspended; every refusal is explained.
+  process outside the game; every refusal is explained.
 - No frozen unit survives Melibea stopping, crashing or restarting.
 
 ## Where the Niri fork lives
