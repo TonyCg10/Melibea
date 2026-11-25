@@ -556,9 +556,11 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
         for (index, window) in game_windows.iter().enumerate() {
             if let Err(error) = niri.set_suspended(*window, true) {
                 // The failing window too: a lost reply may have set it.
-                Self::unflag(niri, &game_windows[..=index]);
+                let unflag = Self::unflag(niri, &game_windows[..=index]);
                 let note = self.restore_ledger(&entries);
-                return Err(block(BlockReason::Compositor(format!("{error}{note}"))));
+                return Err(block(BlockReason::Compositor(format!(
+                    "{error}{unflag}{note}"
+                ))));
             }
         }
         // Step 9: freeze.
@@ -566,11 +568,13 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
             if let Err(error) = self.systemd.freeze(unit) {
                 // The failing unit too: a timed-out freeze may still complete.
                 let stuck = self.thaw_each(&units[..=index]);
-                Self::unflag(niri, &game_windows);
                 let note = if stuck.is_empty() {
-                    self.restore_ledger(&entries)
+                    let unflag = Self::unflag(niri, &game_windows);
+                    format!("{unflag}{}", self.restore_ledger(&entries))
                 } else {
-                    // Keep the entry so recovery still knows these units.
+                    // Something may still be frozen: keep the entry so recovery
+                    // knows the units, and keep the flags so the window takes
+                    // no input before its client can answer.
                     format!("; still frozen: {}", stuck.join("; "))
                 };
                 return Err(block(BlockReason::Systemd(format!("{error}{note}"))));
@@ -583,10 +587,20 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
         })
     }
 
-    /// Clears flags, ignoring errors: a later reconcile clears what is left.
-    fn unflag(niri: &mut impl Compositor, windows: &[u64]) {
-        for window in windows {
-            let _ = niri.set_suspended(*window, false);
+    /// Clears flags; returns a note naming the ones that stay set.
+    fn unflag(niri: &mut impl Compositor, windows: &[u64]) -> String {
+        let failures: Vec<String> = windows
+            .iter()
+            .filter_map(|window| {
+                niri.set_suspended(*window, false)
+                    .err()
+                    .map(|error| format!("window {window}: {error}"))
+            })
+            .collect();
+        if failures.is_empty() {
+            String::new()
+        } else {
+            format!("; flags not cleared: {}", failures.join("; "))
         }
     }
 
@@ -661,18 +675,27 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
                 }
             });
         };
-        let entry = entries.remove(index);
+        let entry = entries[index].clone();
         let failures = self.thaw_each(&entry.units);
         if !failures.is_empty() {
             return Err(block(BlockReason::Systemd(failures.join("; "))));
         }
         let mut errors = Vec::new();
+        let mut still_flagged = Vec::new();
         for window in &entry.windows {
             if windows.iter().any(|view| view.id == *window)
                 && let Err(error) = niri.set_suspended(*window, false)
             {
-                errors.push(error);
+                errors.push(format!("window {window}: {error}"));
+                still_flagged.push(*window);
             }
+        }
+        if still_flagged.is_empty() {
+            entries.remove(index);
+        } else {
+            // Keep the entry for the windows still flagged, so a retried
+            // resume finds it; thawing again is harmless.
+            entries[index].windows = still_flagged;
         }
         self.ledger
             .write(&entries)
@@ -856,8 +879,15 @@ mod tests {
         processes: BTreeMap<u32, ProcessInfo>,
         states: BTreeMap<String, FreezerState>,
         calls: Vec<String>,
-        fail_freeze: bool,
-        fork_after_move: Option<u32>,
+        /// A failing freeze leaves its unit in this state (a timed-out freeze may complete).
+        fail_freeze: Option<FreezerState>,
+        fail_thaw: bool,
+        /// `set_suspended(window, suspended)` calls that fail.
+        fail_flag: BTreeSet<(u64, bool)>,
+        /// One game child forked into the Bottles unit after each move.
+        forks: Vec<u32>,
+        /// A foreign process that appears in this unit when it is started.
+        intruder_on: Option<String>,
         windows: Vec<WindowView>,
     }
 
@@ -884,8 +914,14 @@ mod tests {
                 }
             }
             world.states.insert(unit.to_owned(), FreezerState::Running);
-            if let Some(pid) = world.fork_after_move {
-                world.fork_after_move = Some(pid + 1);
+            if world.intruder_on.as_deref() == Some(unit) {
+                world.processes.insert(
+                    6000,
+                    process(6000, 1, "intruder", Some("intruder"), &in_app(unit)),
+                );
+            }
+            if !world.forks.is_empty() {
+                let pid = world.forks.remove(0);
                 world.processes.insert(
                     pid,
                     process(
@@ -903,7 +939,8 @@ mod tests {
         fn freeze(&self, unit: &str) -> Result<(), SystemdError> {
             let mut world = self.0.borrow_mut();
             world.calls.push(format!("freeze {unit}"));
-            if world.fail_freeze {
+            if let Some(state) = world.fail_freeze {
+                world.states.insert(unit.to_owned(), state);
                 return Err(failed("Access denied"));
             }
             world.states.insert(unit.to_owned(), FreezerState::Frozen);
@@ -913,6 +950,9 @@ mod tests {
         fn thaw(&self, unit: &str) -> Result<(), SystemdError> {
             let mut world = self.0.borrow_mut();
             world.calls.push(format!("thaw {unit}"));
+            if world.fail_thaw {
+                return Err(failed("timed out"));
+            }
             match world.states.get(unit) {
                 None | Some(FreezerState::NotLoaded) => Err(failed("Unit not loaded")),
                 Some(_) => {
@@ -962,6 +1002,9 @@ mod tests {
             world
                 .calls
                 .push(format!("set_suspended {window_id} {suspended}"));
+            if world.fail_flag.contains(&(window_id, suspended)) {
+                return Err(format!("niri refused window {window_id}"));
+            }
             let window = world
                 .windows
                 .iter_mut()
@@ -1436,7 +1479,7 @@ mod tests {
     #[test]
     fn escaped_processes_refuse_after_the_second_discovery() {
         let mut f = Fixture::victoria("escaped");
-        f.world.borrow_mut().fork_after_move = Some(5000);
+        f.world.borrow_mut().forks = vec![5000, 5001];
         let mut niri = f.niri();
         let outcome = f.standby.suspend(&mut niri, None);
         match &outcome {
@@ -1462,7 +1505,7 @@ mod tests {
     #[test]
     fn freeze_failure_rolls_back_flags_and_ledger() {
         let mut f = Fixture::victoria("freeze-fails");
-        f.world.borrow_mut().fail_freeze = true;
+        f.world.borrow_mut().fail_freeze = Some(FreezerState::Running);
         let mut niri = f.niri();
         let outcome = f.standby.suspend(&mut niri, None);
         assert_eq!(blocked_code(&outcome), "systemd");
@@ -1620,40 +1663,163 @@ mod tests {
 
     #[test]
     fn resume_keeps_the_entry_when_a_unit_stays_frozen() {
-        struct Stuck(FakeSystemd);
-        impl Systemd for Stuck {
-            fn start_scope(&self, u: &str, p: &BTreeSet<u32>) -> Result<(), SystemdError> {
-                self.0.start_scope(u, p)
-            }
-            fn freeze(&self, u: &str) -> Result<(), SystemdError> {
-                self.0.freeze(u)
-            }
-            fn thaw(&self, u: &str) -> Result<(), SystemdError> {
-                self.0.0.borrow_mut().calls.push(format!("thaw {u}"));
-                Err(failed("timed out"))
-            }
-            fn freezer_state(&self, u: &str) -> Result<FreezerState, SystemdError> {
-                self.0.freezer_state(u)
-            }
-            fn game_units(&self) -> Result<Vec<String>, SystemdError> {
-                self.0.game_units()
-            }
-        }
-        let f = Fixture::victoria("resume-stuck");
-        let mut standby = Standby::new(
-            Stuck(FakeSystemd(f.world.clone())),
-            FakeProcesses(f.world.clone()),
-            f.standby.ledger.clone(),
-            f.dir.join("games.toml"),
-            OWN_PID,
-            UID,
-        );
+        let mut f = Fixture::victoria("resume-stuck");
         let mut niri = f.niri();
-        standby.suspend(&mut niri, None);
-        let outcome = standby.resume(&mut niri, None);
+        f.standby.suspend(&mut niri, None);
+        f.world.borrow_mut().fail_thaw = true;
+        let outcome = f.standby.resume(&mut niri, None);
         assert_eq!(blocked_code(&outcome), "systemd");
         assert_eq!(f.entries().len(), 1);
         assert_eq!(f.suspended_windows(), [608]);
+    }
+
+    #[test]
+    fn resume_keeps_the_entry_until_every_flag_is_cleared() {
+        let mut world = steam_world();
+        world.windows.push(window(
+            801,
+            "steam_app_5",
+            "tModLoader launcher",
+            3401,
+            false,
+        ));
+        let mut f = Fixture::new("resume-flag-fails", None, world);
+        let mut niri = f.niri();
+        f.standby.suspend(&mut niri, None);
+        f.world.borrow_mut().fail_flag.insert((801, false));
+        let outcome = f.standby.resume(&mut niri, Some(801));
+        assert_eq!(blocked_code(&outcome), "compositor");
+        assert_eq!(
+            f.state("app-melibea-game-3100.scope"),
+            Some(FreezerState::Running)
+        );
+        assert_eq!(f.suspended_windows(), [801]);
+        let entries = f.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].windows, [801]);
+        assert!(f.standby.is_suspended(801));
+        assert!(!f.standby.is_suspended(800));
+        // niri answers again: a retried resume clears the flag and the entry.
+        f.world.borrow_mut().fail_flag.clear();
+        let outcome = f.standby.resume(&mut niri, Some(801));
+        assert!(
+            matches!(&outcome, StandbyOutcome::Applied { windows, .. } if windows == &[801]),
+            "{outcome:?}"
+        );
+        assert!(f.suspended_windows().is_empty());
+        assert!(f.entries().is_empty());
+    }
+
+    #[test]
+    fn flag_failure_rolls_back_flags_and_ledger() {
+        let mut world = steam_world();
+        world.windows.push(window(
+            801,
+            "steam_app_5",
+            "tModLoader launcher",
+            3401,
+            false,
+        ));
+        let mut f = Fixture::new("flag-fails", None, world);
+        f.world.borrow_mut().fail_flag.insert((801, true));
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        assert_eq!(blocked_code(&outcome), "compositor");
+        let changes = f.changes();
+        assert!(
+            changes.contains(&"set_suspended 800 false".to_owned()),
+            "{changes:?}"
+        );
+        assert!(
+            !changes.iter().any(|c| c.starts_with("freeze")),
+            "{changes:?}"
+        );
+        assert!(f.suspended_windows().is_empty());
+        assert!(f.entries().is_empty());
+    }
+
+    #[test]
+    fn a_failed_unflag_in_a_rollback_is_reported() {
+        let mut f = Fixture::victoria("unflag-fails");
+        {
+            let mut world = f.world.borrow_mut();
+            world.fail_freeze = Some(FreezerState::Running);
+            world.fail_flag.insert((608, false));
+        }
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        match &outcome {
+            StandbyOutcome::Blocked {
+                reason: BlockReason::Systemd(text),
+                ..
+            } => assert!(text.contains("flags not cleared: window 608"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(f.suspended_windows(), [608]);
+        assert!(f.entries().is_empty());
+    }
+
+    #[test]
+    fn a_failed_rollback_thaw_keeps_the_entry_and_the_flags() {
+        let mut f = Fixture::victoria("rollback-stuck");
+        {
+            let mut world = f.world.borrow_mut();
+            world.fail_freeze = Some(FreezerState::Frozen);
+            world.fail_thaw = true;
+        }
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        match &outcome {
+            StandbyOutcome::Blocked {
+                reason: BlockReason::Systemd(text),
+                ..
+            } => assert!(text.contains("still frozen"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!f.changes().contains(&"set_suspended 608 false".to_owned()));
+        assert_eq!(f.suspended_windows(), [608]);
+        assert_eq!(f.entries().len(), 1);
+        assert_eq!(f.entries()[0].units, [GAME_UNIT]);
+        // Once systemd answers, an explicit resume releases it.
+        f.world.borrow_mut().fail_thaw = false;
+        let outcome = f.standby.resume(&mut niri, None);
+        assert!(
+            matches!(outcome, StandbyOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(f.state(GAME_UNIT), Some(FreezerState::Running));
+        assert!(f.suspended_windows().is_empty());
+    }
+
+    #[test]
+    fn an_intruder_after_the_second_move_refuses() {
+        let mut f = Fixture::victoria("intruder-second-move");
+        {
+            let mut world = f.world.borrow_mut();
+            world.forks = vec![5000];
+            world.intruder_on = Some("app-melibea-game-5000.scope".into());
+        }
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        assert!(
+            matches!(
+                outcome,
+                StandbyOutcome::Blocked {
+                    reason: BlockReason::ProtectedProcess { pid: 6000, .. },
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            f.changes(),
+            [
+                "start_scope app-melibea-game-4242.scope {4242}",
+                "start_scope app-melibea-game-5000.scope {5000}",
+            ]
+        );
+        assert!(f.entries().is_empty());
+        assert!(f.suspended_windows().is_empty());
     }
 
     #[test]
