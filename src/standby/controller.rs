@@ -23,6 +23,11 @@ use crate::transition::WindowId;
 pub const MOVE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 
 const MOVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How long a thawed unit may stay in a transient freezer state.
+const THAW_CONFIRM_TIMEOUT: Duration = Duration::from_secs(1);
+const THAW_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Appended to a ledger refusal: the way out when the ledger cannot be trusted.
+const THAW_ALL_HINT: &str = "; run `melibea thaw-all` to release every suspended game";
 /// Discoveries that may still move processes; the next one must find none outside.
 const MAX_MOVES: usize = 2;
 /// Highest `-<k>` suffix tried when the plain game unit name is taken.
@@ -196,7 +201,7 @@ impl BlockReason {
             }
             Self::InvalidRules(text) => format!("invalid game rules: {text}"),
             Self::Systemd(text) => format!("systemd: {text}"),
-            Self::Ledger(text) => format!("ledger: {text}"),
+            Self::Ledger(text) => format!("ledger: {text}{THAW_ALL_HINT}"),
             Self::Compositor(text) => format!("niri: {text}"),
         }
     }
@@ -316,6 +321,8 @@ pub struct Standby<S: Systemd, P: ProcessSource> {
     games_path: PathBuf,
     own_pid: u32,
     uid: u32,
+    /// How long `thaw_confirmed` polls a transient freezer state.
+    thaw_timeout: Duration,
 }
 
 impl<S: Systemd, P: ProcessSource> Standby<S, P> {
@@ -335,6 +342,7 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
             games_path,
             own_pid,
             uid,
+            thaw_timeout: THAW_CONFIRM_TIMEOUT,
         }
     }
 
@@ -583,13 +591,16 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
         // Steps 3–5: discover, check, separate, check the units.
         let (table, set) = self.separate(&game.identity).map_err(block)?;
         let units = self.target_units(&table, &set).map_err(block)?;
-        // Step 6: the game's windows.
+        // Step 6: the game's windows. A window recognized by a rule counts
+        // only with the target's app id: a title-only rule also matches a
+        // browser tab named after the game.
         let game_windows: Vec<u64> = windows
             .iter()
             .filter(|window| {
-                let same_game = rules
-                    .recognize(window.app_id.as_deref(), window.title.as_deref())
-                    .is_some_and(|other| other.identity == game.identity);
+                let same_game = window.app_id == target.app_id
+                    && rules
+                        .recognize(window.app_id.as_deref(), window.title.as_deref())
+                        .is_some_and(|other| other.identity == game.identity);
                 let in_set = window
                     .pid
                     .and_then(|pid| u32::try_from(pid).ok())
@@ -680,13 +691,22 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
 
     // ---- resume ----------------------------------------------------------
 
-    /// Thaws `unit` and confirms it running or gone.
+    /// Thaws `unit` and confirms it running or gone. A transient state
+    /// (`Thawing`, `Freezing`) is polled until it settles or `thaw_timeout`.
     fn thaw_confirmed(&self, unit: &str) -> Result<(), String> {
         let thawed = self.systemd.thaw(unit);
-        let state = self
-            .systemd
-            .freezer_state(unit)
-            .map_err(|error| format!("{unit}: {error}"))?;
+        let deadline = Instant::now() + self.thaw_timeout;
+        let state = loop {
+            let state = self
+                .systemd
+                .freezer_state(unit)
+                .map_err(|error| format!("{unit}: {error}"))?;
+            let transient = matches!(state, FreezerState::Thawing | FreezerState::Freezing);
+            if !transient || Instant::now() >= deadline {
+                break state;
+            }
+            thread::sleep(THAW_POLL_INTERVAL);
+        };
         match (state, thawed) {
             (FreezerState::Running | FreezerState::NotLoaded, _) => Ok(()),
             (_, Err(error)) => Err(format!("cannot thaw {unit}: {error}")),
@@ -858,7 +878,9 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
     }
 
     /// Thaws every ledger unit and every listed game unit, clears niri's flags
-    /// when given niri, and empties the ledger.
+    /// when given niri, and empties the ledger. Flags are cleared on every
+    /// window `Compositor::windows` lists, visible or minimized. An unreadable
+    /// or unresolved ledger still thaws every listed game unit.
     pub fn thaw_all<C: Compositor>(&mut self, niri: Option<&mut C>) -> Vec<String> {
         let mut lines = Vec::new();
         let mut units = BTreeSet::new();
@@ -947,6 +969,8 @@ mod tests {
         /// A foreign process that appears in this unit when it is started.
         intruder_on: Option<String>,
         windows: Vec<WindowView>,
+        /// States `freezer_state` reports, one per call, before the stored ones.
+        reports: Vec<FreezerState>,
     }
 
     type Shared = Rc<RefCell<World>>;
@@ -1023,6 +1047,9 @@ mod tests {
         fn freezer_state(&self, unit: &str) -> Result<FreezerState, SystemdError> {
             let mut world = self.0.borrow_mut();
             world.calls.push(format!("freezer_state {unit}"));
+            if !world.reports.is_empty() {
+                return Ok(world.reports.remove(0));
+            }
             Ok(world
                 .states
                 .get(unit)
@@ -2030,6 +2057,123 @@ mod tests {
         f.standby.thaw_all::<FakeCompositor>(None);
         assert_eq!(f.state(GAME_UNIT), Some(FreezerState::Running));
         assert!(f.entries().is_empty());
+    }
+
+    #[test]
+    fn a_title_only_rule_does_not_flag_a_browser_tab() {
+        let mut world = steam_world();
+        world.windows = vec![
+            window(800, "dotnet", "Terraria: Journey's End", 3400, true),
+            window(
+                900,
+                "firefox",
+                "Terraria Wiki — Mozilla Firefox",
+                5500,
+                false,
+            ),
+        ];
+        let rules = "[[game]]\ntitle = \"^Terraria\"\nsteam_app_id = 5\n";
+        let mut f = Fixture::new("title-only", Some(rules), world);
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        assert!(
+            matches!(&outcome, StandbyOutcome::Applied { windows, .. } if windows == &[800]),
+            "{outcome:?}"
+        );
+        assert_eq!(f.suspended_windows(), [800]);
+        assert_eq!(f.entries()[0].windows, [800]);
+    }
+
+    #[test]
+    fn resume_waits_for_a_transient_freezer_state() {
+        let mut f = Fixture::victoria("resume-thawing");
+        let mut niri = f.niri();
+        f.standby.suspend(&mut niri, None);
+        f.world.borrow_mut().reports = vec![FreezerState::Thawing, FreezerState::Running];
+        let outcome = f.standby.resume(&mut niri, None);
+        assert!(
+            matches!(outcome, StandbyOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        assert!(f.world.borrow().reports.is_empty());
+        assert!(f.suspended_windows().is_empty());
+        assert!(f.entries().is_empty());
+    }
+
+    #[test]
+    fn resume_gives_up_on_a_state_that_stays_transient() {
+        let mut f = Fixture::victoria("resume-stays-thawing");
+        f.standby.thaw_timeout = Duration::from_millis(120);
+        let mut niri = f.niri();
+        f.standby.suspend(&mut niri, None);
+        f.world.borrow_mut().reports = vec![FreezerState::Thawing; 50];
+        let started = Instant::now();
+        let outcome = f.standby.resume(&mut niri, None);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        match &outcome {
+            StandbyOutcome::Blocked {
+                reason: BlockReason::Systemd(text),
+                ..
+            } => assert!(text.contains("Thawing after thawing"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(f.entries().len(), 1);
+        assert_eq!(f.suspended_windows(), [608]);
+    }
+
+    #[test]
+    fn a_ledger_refusal_points_to_thaw_all() {
+        let mut f = Fixture::victoria("ledger-hint");
+        fs::create_dir_all(f.dir.join("run")).unwrap();
+        fs::write(f.dir.join("run").join("standby.json"), "{oops").unwrap();
+        let mut niri = f.niri();
+        for outcome in [
+            f.standby.resume(&mut niri, None),
+            f.standby.suspend(&mut niri, None),
+        ] {
+            let result = outcome_result(&outcome);
+            let reason = result.reason.expect("a blocked result has a reason");
+            assert!(reason.starts_with("ledger: "), "{reason}");
+            assert!(
+                reason.ends_with("; run `melibea thaw-all` to release every suspended game"),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn thaw_all_with_an_unresolved_ledger_still_thaws_listed_units() {
+        let mut f = Fixture::victoria("thaw-all-unresolved");
+        f.standby.ledger = Ledger::unresolved();
+        {
+            let mut world = f.world.borrow_mut();
+            world.states.insert(GAME_UNIT.into(), FreezerState::Frozen);
+            world.windows[0].is_suspended = true;
+        }
+        let mut niri = f.niri();
+        let lines = f.standby.thaw_all(Some(&mut niri));
+        assert_eq!(f.state(GAME_UNIT), Some(FreezerState::Running));
+        assert!(f.suspended_windows().is_empty());
+        assert!(
+            lines.iter().any(|line| line.contains("XDG_RUNTIME_DIR")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn thaw_all_clears_the_flag_of_a_minimized_window() {
+        let mut f = Fixture::victoria("thaw-all-minimized");
+        {
+            let mut world = f.world.borrow_mut();
+            world.states.insert(GAME_UNIT.into(), FreezerState::Frozen);
+            world.windows[0].is_suspended = true;
+            world.windows[0].is_minimized = true;
+            world.windows[0].is_focused = false;
+        }
+        let mut niri = f.niri();
+        f.standby.thaw_all(Some(&mut niri));
+        assert!(f.changes().contains(&"set_suspended 608 false".to_owned()));
+        assert!(f.suspended_windows().is_empty());
     }
 
     #[test]

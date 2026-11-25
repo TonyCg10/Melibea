@@ -17,6 +17,32 @@ their bytes. Niri still owns every mapped surface and all minimized state.
   `unsupported Melibea protocol version N; supported versions are 1, 2 and 3`.
 - `action_result` gains an optional `reason`. It is omitted whenever it is
   absent, so v1 and v2 results are byte-identical to before.
+- Only error text changes for versions 1 and 2; no valid v1 or v2 exchange
+  changes. A malformed request still receives `invalid_request` with an
+  `invalid request JSON: …` message; when the message lists the expected
+  request types (an unknown `type`, for example), the list now includes
+  `suspend`, `resume`, `toggle_suspend` and `list_suspended`. A v1 or v2 `suspend`, `resume`, `toggle_suspend` or `list_suspended`
+  receives `suspension requires Melibea protocol version 3`.
+
+## Restore and close of a suspended window
+
+At every version, `restore` and `close` of a window that standby suspended
+first resume its game, because a frozen client can neither be shown usefully
+nor answer a close request. When the resume applies, the action is forwarded
+as usual and its result is the only reply. When the resume does not apply
+(for example a unit stays frozen, or the ledger cannot be read), the action is
+not forwarded and the client receives the resume's own result instead, at the
+request's version:
+
+```json
+{"version":1,"message":{"type":"action_result","operation":"resume","requested_id":608,"window_id":608,"status":"blocked","reason":"systemd: …"}}
+```
+
+So a v1 or v2 client can see `operation: resume`, `status: blocked` and a
+`reason` in reply to `restore` or `close`; it does only for a window that was
+suspended through version 3 or by standby after minimizing. Nothing changed:
+the window is still minimized (or open) and suspended. Retry after the cause
+is fixed, or run `melibea thaw-all`.
 
 ## Requests
 
@@ -69,7 +95,7 @@ A `blocked` result carries `reason` as `<code>: <description>`. The codes:
 | `game_escaped` | Game processes stayed outside the game scope. |
 | `invalid_rules` | `games.toml` is invalid. |
 | `systemd` | A systemd call failed. |
-| `ledger` | The standby ledger could not be read or written. |
+| `ledger` | The standby ledger could not be read or written; the description ends with ``; run `melibea thaw-all` to release every suspended game``. |
 | `compositor` | niri refused or could not be reached. |
 
 The description after the colon is for people and may change; match the code.

@@ -614,14 +614,38 @@ fn describe_standby(result: &ActionResult) -> Result<String, String> {
 }
 
 /// Thaws every game locally; the daemon is not needed.
+///
+/// It never reads `games.toml` (the rules path is a placeholder), and an
+/// unresolved ledger path or an unreadable `/proc/self` still thaws every
+/// loaded game unit and clears niri's flags; the exit status reports them
+/// only after everything that could be done is done.
 fn thaw_all() -> ExitCode {
-    let mut standby = match live_standby() {
-        Ok((standby, _)) => standby,
-        Err(error) => {
+    let mut failed = false;
+    let ledger = Ledger::default_path().map_or_else(
+        |error| {
             errorln!("{error}");
-            return ExitCode::FAILURE;
-        }
-    };
+            failed = true;
+            Ledger::unresolved()
+        },
+        Ledger::at,
+    );
+    // The uid only guards suspension; thawing never reads it.
+    let uid = fs::metadata("/proc/self").map_or_else(
+        |error| {
+            errorln!("cannot read /proc/self: {error}");
+            failed = true;
+            u32::MAX
+        },
+        |metadata| std::os::unix::fs::MetadataExt::uid(&metadata),
+    );
+    let mut standby = Standby::new(
+        SystemdTools::new(),
+        ProcFs,
+        ledger,
+        PathBuf::from("/nonexistent/melibea-thaw-all-reads-no-rules"),
+        std::process::id(),
+        uid,
+    );
     let lines = match NiriActionClient::connect() {
         Ok(client) => standby.thaw_all(Some(&mut LiveCompositor::new(client))),
         Err(_) => standby.thaw_all(None::<&mut LiveCompositor>),
@@ -629,7 +653,11 @@ fn thaw_all() -> ExitCode {
     for line in lines {
         outputln!("{line}");
     }
-    ExitCode::SUCCESS
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// The standby controller over systemd and `/proc`, with the games path it reads.

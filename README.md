@@ -103,6 +103,12 @@ title = "^Terraria"
 steam_app_id = 1281930
 ```
 
+Name `app_id` in every rule and anchor `title` with `^`: a rule with only a
+title also matches a browser tab named after the game ("Terraria Wiki —
+Mozilla Firefox"). Melibea suspends together only the windows that share the
+target's app id or whose process belongs to the game, but a title-only rule
+can still make a browser tab the target.
+
 A missing file means no rules; an invalid one refuses suspension and turns off
 standby after minimizing, but never affects resume or recovery.
 
@@ -131,9 +137,12 @@ An example niri bind:
 
 ```kdl
 binds {
-    Mod+Shift+P { spawn "melibea" "toggle-suspend"; }
+    Mod+Shift+P allow-inhibiting=false { spawn "melibea" "toggle-suspend"; }
 }
 ```
+
+`allow-inhibiting=false` keeps the bind working while a native Wayland game
+inhibits keyboard shortcuts; otherwise the game would swallow the toggle.
 
 The suspended look needs the Niri fork, configured by its `suspend { }` block
 (these are the defaults):

@@ -1,6 +1,10 @@
 # Copy to $XDG_CONFIG_HOME/melibea/games.toml (or ~/.config/melibea/games.toml).
 # Rules are resolved top to bottom; the first match wins. A window whose app id
 # is `steam_app_<N>` is a game even without a rule.
+#
+# Name `app_id` in every rule and anchor `title` with `^`: a title-only rule
+# also matches a browser tab named after the game ("Terraria Wiki — Mozilla
+# Firefox").
 
 # A Wine game found by the name of its executable.
 [[game]]

@@ -295,18 +295,37 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    /// Serializes the tests that write and run stub scripts.
+    ///
+    /// Executing a file fails with `ETXTBSY` while any process holds it open
+    /// for writing. When one test thread writes its script while another
+    /// forks to run its own, the child inherits the writer's descriptor and
+    /// keeps it until its `exec` closes it (close-on-exec), so the first
+    /// thread's `exec` can fail. Renaming a finished temporary file does not
+    /// help: the inherited descriptor still refers to the same inode. These
+    /// tests are the only ones in the binary that fork, so holding this lock
+    /// for each test's whole life means no script is ever open for writing
+    /// while another test forks.
+    static STUB_LOCK: Mutex<()> = Mutex::new(());
 
     struct Stubs {
         dir: PathBuf,
+        _serial: MutexGuard<'static, ()>,
     }
 
     impl Stubs {
         fn new(name: &str) -> Self {
+            let serial = STUB_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
             let dir =
                 std::env::temp_dir().join(format!("melibea-systemd-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
-            Self { dir }
+            Self {
+                dir,
+                _serial: serial,
+            }
         }
 
         fn script(&self, file: &str, body: &str) -> PathBuf {
