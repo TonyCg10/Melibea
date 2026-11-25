@@ -91,7 +91,9 @@ Steam game, native or Proton) or `WINESERVERSOCKET` (Wine, Proton, Bottles,
 Lutris, Heroic). For a native Wayland window that process is niri's pid; for an
 X11 window niri reports `xwayland-satellite`, so Melibea asks the X server
 (X-Resource) which process owns the window, and recognizes it only when exactly
-one does. `WINEPREFIX` alone never marks a game.
+one does. `WINEPREFIX` alone never marks a game. The X server must report the
+same title niri does, so a game whose title changes every frame (an FPS counter
+in the title) may need a second press, or a rule.
 
 Rules remain for native non-Steam games and for `standby_after`. They are in
 `~/.config/melibea/games.toml`, or `$XDG_CONFIG_HOME/melibea/games.toml` when
