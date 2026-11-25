@@ -9,4 +9,5 @@ pub mod niri;
 pub mod niri_ipc;
 pub mod protocol;
 pub mod service;
+pub mod standby;
 pub mod transition;
