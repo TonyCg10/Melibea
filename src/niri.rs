@@ -1,6 +1,10 @@
 //! Transport-neutral adaptation of niri 26.04 event-stream JSON.
 
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -69,7 +73,10 @@ pub enum NiriEvent {
         windows: Vec<NiriWindow>,
     },
     MinimizedWindowsChanged {
+        /// The protocol v1/v2 projection; it carries no suspended flag.
         windows: Vec<MinimizedWindow>,
+        /// The minimized windows niri reports `is_suspended`.
+        suspended: BTreeSet<WindowId>,
     },
     WindowOpenedOrChanged {
         window: NiriWindow,
@@ -119,12 +126,19 @@ pub fn parse_event_line(line: &str) -> Result<NiriEvent, NiriEventError> {
         }
         "MinimizedWindowsChanged" => {
             let payload: MinimizedWindowsChangedPayload = decode_payload(&name, payload)?;
+            let suspended = payload
+                .windows
+                .iter()
+                .filter(|window| window.is_suspended)
+                .map(|window| WindowId(window.id))
+                .collect();
             Ok(NiriEvent::MinimizedWindowsChanged {
                 windows: payload
                     .windows
                     .into_iter()
                     .map(NiriMinimizedWindow::into_window)
                     .collect(),
+                suspended,
             })
         }
         "WindowOpenedOrChanged" => {
@@ -174,6 +188,8 @@ struct NiriMinimizedWindow {
     id: u64,
     title: Option<String>,
     app_id: Option<String>,
+    #[serde(default)]
+    is_suspended: bool,
 }
 
 impl NiriMinimizedWindow {
@@ -370,10 +386,14 @@ impl Error for NiriAdapterError {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{NiriAdapter, NiriAdapterError, NiriEvent, parse_event_line};
     use crate::{
         attention::WidthPolicy,
         config::Config,
+        minimization::MinimizedWindow,
+        protocol::Window,
         transition::{DecisionOutcome, ExclusionReason, WindowId},
     };
 
@@ -449,13 +469,47 @@ mod tests {
         )
         .expect("valid minimized snapshot");
 
-        let NiriEvent::MinimizedWindowsChanged { windows } = event else {
+        let NiriEvent::MinimizedWindowsChanged { windows, suspended } = event else {
             panic!("expected minimized window snapshot")
         };
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].id, WindowId(42));
         assert_eq!(windows[0].app_id.as_deref(), Some("kitty"));
         assert_eq!(windows[0].title.as_deref(), Some("scratch"));
+        assert!(suspended.is_empty());
+    }
+
+    #[test]
+    fn minimized_suspended_flags_are_kept_apart_from_the_projection() {
+        let event = parse_event_line(
+            r#"{"MinimizedWindowsChanged":{"windows":[{"id":42,"title":"game","app_id":"steam_app_1","pid":10,"is_suspended":true},{"id":43,"title":"scratch","app_id":"kitty","pid":11,"is_suspended":false}]}}"#,
+        )
+        .expect("valid minimized snapshot");
+
+        let NiriEvent::MinimizedWindowsChanged { windows, suspended } = event else {
+            panic!("expected minimized window snapshot")
+        };
+        assert_eq!(suspended, BTreeSet::from([WindowId(42)]));
+        // The v1/v2 projection sees the same records as before the flag existed.
+        assert_eq!(
+            windows,
+            vec![
+                MinimizedWindow {
+                    id: WindowId(42),
+                    app_id: Some("steam_app_1".to_owned()),
+                    title: Some("game".to_owned()),
+                },
+                MinimizedWindow {
+                    id: WindowId(43),
+                    app_id: Some("kitty".to_owned()),
+                    title: Some("scratch".to_owned()),
+                },
+            ]
+        );
+        assert_eq!(
+            serde_json::to_string(&Window::from(&windows[0])).expect("encodable window"),
+            r#"{"id":42,"app_id":"steam_app_1","title":"game","icon_name":null}"#
+        );
     }
 
     #[test]

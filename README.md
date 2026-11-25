@@ -76,6 +76,76 @@ A valid edit replaces the policy and rebuilds from a fresh niri snapshot. An
 invalid or temporarily unreadable edit is reported but never replaces the last
 known-good policy or stops the controller.
 
+## Standby for games
+
+Melibea can suspend a game: it moves the game's processes into a systemd
+scope of their own (`app-melibea-game-<pid>.scope`), freezes that scope, and
+asks niri to draw the window blurred and dimmed and to send it no input.
+Resuming thaws the scope first and clears the niri flag afterwards. See the
+[design](docs/superpowers/specs/2026-11-17-melibea-standby-design.md) and
+[PROTOCOL-V3.md](PROTOCOL-V3.md).
+
+A window whose app id is `steam_app_<N>` is a game without any configuration.
+Other games are named in `~/.config/melibea/games.toml`, or
+`$XDG_CONFIG_HOME/melibea/games.toml` when `XDG_CONFIG_HOME` is set. Rules are
+resolved from top to bottom and the first match wins:
+
+```toml
+[[game]]
+app_id = "^steam_proton$"     # regex, optional
+title = "^Victoria 3$"        # regex, optional; at least one of the two
+process = "victoria3.exe"     # this, or steam_app_id, or neither
+standby_after = "5m"          # optional: suspend after staying minimized this long
+
+[[game]]                      # a native Steam game: its window is not steam_app_<N>
+app_id = "^dotnet$"
+title = "^Terraria"
+steam_app_id = 1281930
+```
+
+A missing file means no rules; an invalid one refuses suspension and turns off
+standby after minimizing, but never affects resume or recovery.
+
+```sh
+melibea suspend [WINDOW_ID]          # the focused window's game when the id is omitted
+melibea resume [WINDOW_ID]
+melibea toggle-suspend [WINDOW_ID]
+melibea thaw-all                     # works without the daemon
+```
+
+`suspend`, `resume` and `toggle-suspend` go through the running daemon over
+protocol v3. A refusal prints its reason and changes nothing. `thaw-all` thaws
+every unit in the ledger (`$XDG_RUNTIME_DIR/melibea/standby.json`) and every
+loaded `app-melibea-game-*.scope`, and clears niri's flags when niri answers.
+The service unit runs it from `ExecStopPost`, so stopping or crashing the
+daemon releases every game. On start and after every niri reconnection the
+daemon reconciles the ledger, niri's flags and systemd's freezer, and logs
+what it changed.
+
+A minimized game whose rule names `standby_after` is suspended once it has
+stayed minimized that long. When it leaves the minimized list, by Melibea's
+restore or by niri directly, it is resumed at once. Melibea's `restore` and
+`close` resume a suspended window before forwarding the action.
+
+An example niri bind:
+
+```kdl
+binds {
+    Mod+Shift+P { spawn "melibea" "toggle-suspend"; }
+}
+```
+
+The suspended look needs the Niri fork, configured by its `suspend { }` block
+(these are the defaults):
+
+```kdl
+suspend {
+    blur-passes 3    // 1 to 31
+    blur-offset 3.0  // 0 to 100
+    dim 0.35         // 0 to 1
+}
+```
+
 ## Daily trial
 
 Build and install the binary with:
@@ -134,8 +204,9 @@ against real GTK and Kitty clients. The Celestina integration reconstructed a
 two-window group, restored one entry and retained the other until Niri's later
 authoritative close revision.
 
-See [PROTOCOL.md](PROTOCOL.md) for the frozen v1 wire contract and
-[PROTOCOL-V2.md](PROTOCOL-V2.md) for the action-scoped motion extension,
+See [PROTOCOL.md](PROTOCOL.md) for the frozen v1 wire contract,
+[PROTOCOL-V2.md](PROTOCOL-V2.md) for the action-scoped motion extension and
+[PROTOCOL-V3.md](PROTOCOL-V3.md) for standby,
 [PROJECT.md](PROJECT.md) for product boundaries, and [ROADMAP.md](ROADMAP.md)
 for the active milestone. Agents start with [AGENTS.md](AGENTS.md); completed
 milestones and the superseded M7 hand-off are in [docs/history](docs/history/).

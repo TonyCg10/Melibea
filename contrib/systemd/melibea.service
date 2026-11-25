@@ -5,6 +5,8 @@ Documentation=https://github.com/TonyCg10/Melibea
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/melibea run
+# Release every suspended game whenever the daemon stops or crashes.
+ExecStopPost=%h/.local/bin/melibea thaw-all
 Restart=on-failure
 RestartSec=1s
 StandardOutput=journal

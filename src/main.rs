@@ -1,9 +1,13 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env, fmt, fs,
     io::{self, Write},
     path::PathBuf,
     process::ExitCode,
-    sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -12,21 +16,23 @@ use melibea::{
     config::{Config, default_config_path},
     executor::PendingResizes,
     health::HealthReport,
-    minimization::{MinimizationEvent, MinimizedRegistry, RegistryChange},
-    niri::{NiriAdapter, NiriEvent},
+    minimization::{MinimizationEvent, MinimizedRegistry, MinimizedWindow, RegistryChange},
+    niri::{NiriAdapter, NiriEvent, NiriWindow},
     niri_ipc::{
         NIRI_SOCKET_ENV, NiriActionClient, NiriEventStream, NiriEventStreamCancellation,
         NiriWindowActionResult, NiriWindowActionStatus,
     },
     protocol::{
         ActionResult, ActionStatus, Message as ProtocolMessage, Operation, Request, ServerMessage,
+        SuspendedWindow,
     },
-    service::{Service, ServiceClient, socket_path},
+    service::{ActionExecutor, Service, ServiceClient, socket_path},
     standby::{
-        controller::{LiveCompositor, ProcFs, Standby},
-        games::default_games_path,
+        controller::{LiveCompositor, ProcFs, Standby, StandbyOutcome, outcome_result},
+        games::{GameRules, default_games_path},
         ledger::{Ledger, LedgerEntry},
         systemd::SystemdTools,
+        timers::StandbyTimers,
     },
     transition::{DecisionOutcome, ExclusionReason, FocusState, FocusTransition, WindowId},
 };
@@ -609,35 +615,13 @@ fn describe_standby(result: &ActionResult) -> Result<String, String> {
 
 /// Thaws every game locally; the daemon is not needed.
 fn thaw_all() -> ExitCode {
-    let games_path = match default_games_path() {
-        Ok(path) => path,
+    let mut standby = match live_standby() {
+        Ok((standby, _)) => standby,
         Err(error) => {
             errorln!("{error}");
             return ExitCode::FAILURE;
         }
     };
-    let ledger = match Ledger::default_path() {
-        Ok(path) => Ledger::at(path),
-        Err(error) => {
-            errorln!("{error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let uid = match fs::metadata("/proc/self") {
-        Ok(metadata) => std::os::unix::fs::MetadataExt::uid(&metadata),
-        Err(error) => {
-            errorln!("cannot read /proc/self: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut standby = Standby::new(
-        SystemdTools::new(),
-        ProcFs,
-        ledger,
-        games_path,
-        std::process::id(),
-        uid,
-    );
     let lines = match NiriActionClient::connect() {
         Ok(client) => standby.thaw_all(Some(&mut LiveCompositor::new(client))),
         Err(_) => standby.thaw_all(None::<&mut LiveCompositor>),
@@ -646,6 +630,54 @@ fn thaw_all() -> ExitCode {
         outputln!("{line}");
     }
     ExitCode::SUCCESS
+}
+
+/// The standby controller over systemd and `/proc`, with the games path it reads.
+fn live_standby() -> Result<(LiveStandby, PathBuf), String> {
+    let games_path = default_games_path().map_err(|error| error.to_string())?;
+    let ledger = Ledger::at(Ledger::default_path().map_err(|error| error.to_string())?);
+    // The owner of /proc/self: the same source the process table reads uids from.
+    let uid = fs::metadata("/proc/self")
+        .map(|metadata| std::os::unix::fs::MetadataExt::uid(&metadata))
+        .map_err(|error| format!("cannot read /proc/self: {error}"))?;
+    let standby = Standby::new(
+        SystemdTools::new(),
+        ProcFs,
+        ledger,
+        games_path.clone(),
+        std::process::id(),
+        uid,
+    );
+    Ok((standby, games_path))
+}
+
+type LiveStandby = Standby<SystemdTools, ProcFs>;
+
+/// The standby controller shared by the service executor and the controller loop.
+///
+/// Lock discipline (prevents a deadlock): the executor runs on the service's
+/// broker thread, and every `Service::publish_*` waits for that thread. So the
+/// executor never calls a `Service` method, and the controller loop never holds
+/// this mutex while it publishes: it takes the lock, acts, drops it, then publishes.
+type SharedStandby = Arc<Mutex<LiveStandby>>;
+
+fn lock_standby(standby: &SharedStandby) -> MutexGuard<'_, LiveStandby> {
+    // The controller keeps its state in files, so a panic elsewhere leaves nothing half-done here.
+    standby.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Maps a standby outcome for a client: `requested_id` is what the request
+/// named (none for the focused window), `window_id` the window acted on.
+fn standby_action_result(outcome: &StandbyOutcome, requested_id: Option<u64>) -> ActionResult {
+    ActionResult {
+        requested_id,
+        ..outcome_result(outcome)
+    }
+}
+
+/// A log line for a standby outcome the daemon started itself.
+fn standby_log_line(outcome: &StandbyOutcome) -> String {
+    describe_standby(&outcome_result(outcome)).unwrap_or_else(|reason| reason)
 }
 
 fn service_subscribe() -> ExitCode {
@@ -729,7 +761,60 @@ const fn error_code_name(code: melibea::protocol::ErrorCode) -> &'static str {
     }
 }
 
-fn execute_protocol_action(request: &Request) -> Result<ActionResult, String> {
+/// The daemon's protocol action executor. It runs on the service's broker
+/// thread, so it must never call a `Service` method (see [`SharedStandby`]).
+struct DaemonExecutor {
+    standby: SharedStandby,
+}
+
+impl ActionExecutor for DaemonExecutor {
+    fn execute(&self, request: &Request) -> Result<ActionResult, String> {
+        match request {
+            Request::Suspend { window_id } => self.standby_action(*window_id, Standby::suspend),
+            Request::Resume { window_id } => self.standby_action(*window_id, Standby::resume),
+            Request::ToggleSuspend { window_id } => {
+                self.standby_action(*window_id, Standby::toggle)
+            }
+            Request::Restore { window_id, .. } | Request::Close { window_id } => {
+                match self.resume_before_forwarding(*window_id)? {
+                    Some(refused) => Ok(refused),
+                    None => execute_native_action(request),
+                }
+            }
+            Request::Minimize { .. }
+            | Request::List
+            | Request::Subscribe
+            | Request::ListSuspended => execute_native_action(request),
+        }
+    }
+}
+
+impl DaemonExecutor {
+    fn standby_action(
+        &self,
+        window_id: Option<u64>,
+        action: impl FnOnce(&mut LiveStandby, &mut LiveCompositor, Option<u64>) -> StandbyOutcome,
+    ) -> Result<ActionResult, String> {
+        let mut niri = LiveCompositor::connect().map_err(|error| error.to_string())?;
+        let outcome = action(&mut lock_standby(&self.standby), &mut niri, window_id);
+        Ok(standby_action_result(&outcome, window_id))
+    }
+
+    /// Resumes a suspended window before it is restored or closed. Returns the
+    /// resume's result when it did not apply, so the action is not forwarded.
+    fn resume_before_forwarding(&self, window_id: u64) -> Result<Option<ActionResult>, String> {
+        let mut standby = lock_standby(&self.standby);
+        if !standby.is_suspended(window_id) {
+            return Ok(None);
+        }
+        let mut niri = LiveCompositor::connect().map_err(|error| error.to_string())?;
+        let outcome = standby.resume(&mut niri, Some(window_id));
+        Ok((!matches!(outcome, StandbyOutcome::Applied { .. }))
+            .then(|| standby_action_result(&outcome, Some(window_id))))
+    }
+}
+
+fn execute_native_action(request: &Request) -> Result<ActionResult, String> {
     let mut client = NiriActionClient::connect().map_err(|error| error.to_string())?;
     let (operation, result) = match request {
         Request::Minimize {
@@ -749,11 +834,12 @@ fn execute_protocol_action(request: &Request) -> Result<ActionResult, String> {
         Request::Close { window_id } => {
             (Operation::Close, client.close_window(WindowId(*window_id)))
         }
-        Request::Suspend { .. } | Request::Resume { .. } | Request::ToggleSuspend { .. } => {
-            // Task 12 replaces this executor with the standby controller.
-            return Err("suspension is not wired into this daemon yet".to_owned());
-        }
-        Request::List | Request::Subscribe | Request::ListSuspended => {
+        Request::Suspend { .. }
+        | Request::Resume { .. }
+        | Request::ToggleSuspend { .. }
+        | Request::List
+        | Request::Subscribe
+        | Request::ListSuspended => {
             return Err("request is not a compositor action".to_owned());
         }
     };
@@ -849,22 +935,30 @@ fn run_controller_inner(path: Option<PathBuf>) -> Result<(), String> {
         ));
     }
 
+    let (standby, games_path) = live_standby()?;
+    let standby: SharedStandby = Arc::new(Mutex::new(standby));
     let service_path = socket_path().map_err(|error| error.to_string())?;
-    let service = Service::start(&service_path, execute_protocol_action)
-        .map_err(|error| error.to_string())?;
+    let service = Service::start(
+        &service_path,
+        DaemonExecutor {
+            standby: Arc::clone(&standby),
+        },
+    )
+    .map_err(|error| error.to_string())?;
 
     outputln!(
         "running focus-responsive geometry with configuration from {}",
         path.display()
     );
     outputln!(
-        "serving Melibea protocols v1/v2 on {}",
+        "serving Melibea protocols v1/v2/v3 on {}",
         service_path.display()
     );
     let mut watcher = ConfigWatcher::new(path, source);
 
     loop {
-        match run_controller_connection(config.clone(), &mut watcher, &service) {
+        let standby_loop = StandbyLoop::new(Arc::clone(&standby), games_path.clone());
+        match run_controller_connection(config.clone(), &mut watcher, &service, standby_loop) {
             Ok(reloaded) => {
                 service
                     .set_unavailable("reloading configuration and rebuilding niri state")
@@ -890,6 +984,7 @@ fn run_controller_connection(
     config: Config,
     watcher: &mut ConfigWatcher,
     service: &Service,
+    mut standby: StandbyLoop,
 ) -> Result<Config, String> {
     let stream = NiriEventStream::connect().map_err(|error| error.to_string())?;
     let mut actions = NiriActionClient::connect().map_err(|error| error.to_string())?;
@@ -903,26 +998,38 @@ fn run_controller_connection(
     loop {
         let message = match reader.receiver.recv_timeout(CONFIG_POLL_INTERVAL) {
             Ok(message) => message,
-            Err(RecvTimeoutError::Timeout) => match watcher.poll_if_due() {
-                ConfigPoll::Unchanged => continue,
-                ConfigPoll::Reloaded(config) => return Ok(config),
-                ConfigPoll::Rejected(error) => {
-                    errorln!("{error}; keeping last known-good policy");
-                    continue;
+            Err(RecvTimeoutError::Timeout) => {
+                standby.suspend_due(Instant::now());
+                match watcher.poll_if_due() {
+                    ConfigPoll::Unchanged => continue,
+                    ConfigPoll::Reloaded(config) => return Ok(config),
+                    ConfigPoll::Rejected(error) => {
+                        errorln!("{error}; keeping last known-good policy");
+                        continue;
+                    }
                 }
-            },
+            }
             Err(RecvTimeoutError::Disconnected) => {
                 return Err("niri event reader stopped unexpectedly".to_owned());
             }
         };
-        ingest_stream_message(message, &mut adapter, &mut pending, &mut minimized, service)?;
+        ingest_stream_message(
+            message,
+            &mut adapter,
+            &mut pending,
+            &mut minimized,
+            service,
+            &mut standby,
+        )?;
         drain_stream_messages(
             &reader.receiver,
             &mut adapter,
             &mut pending,
             &mut minimized,
             service,
+            &mut standby,
         )?;
+        standby.suspend_due(Instant::now());
 
         match watcher.poll_if_due() {
             ConfigPoll::Unchanged => {}
@@ -940,6 +1047,7 @@ fn run_controller_connection(
                 &mut pending,
                 &mut minimized,
                 service,
+                &mut standby,
             )?;
             let Some(action) = pending.pop_next() else {
                 break;
@@ -991,10 +1099,13 @@ fn drain_stream_messages(
     pending: &mut PendingResizes,
     minimized: &mut MinimizedRegistry,
     service: &Service,
+    standby: &mut StandbyLoop,
 ) -> Result<(), String> {
     loop {
         match receiver.try_recv() {
-            Ok(message) => ingest_stream_message(message, adapter, pending, minimized, service)?,
+            Ok(message) => {
+                ingest_stream_message(message, adapter, pending, minimized, service, standby)?;
+            }
             Err(TryRecvError::Empty) => return Ok(()),
             Err(TryRecvError::Disconnected) => {
                 return Err("niri event reader stopped unexpectedly".to_owned());
@@ -1009,6 +1120,7 @@ fn ingest_stream_message(
     pending: &mut PendingResizes,
     minimized: &mut MinimizedRegistry,
     service: &Service,
+    standby: &mut StandbyLoop,
 ) -> Result<(), String> {
     let event = match message {
         Ok(Some(event)) => event,
@@ -1016,7 +1128,7 @@ fn ingest_stream_message(
         Err(error) => return Err(error),
     };
     let name = event_name(&event);
-    if let NiriEvent::MinimizedWindowsChanged { windows } = &event {
+    if let NiriEvent::MinimizedWindowsChanged { windows, .. } = &event {
         let change = minimized
             .apply(MinimizationEvent::Snapshot {
                 windows: windows.clone(),
@@ -1032,6 +1144,14 @@ fn ingest_stream_message(
                 minimized.windows().len()
             );
         }
+    }
+    // `observe` takes and drops the standby lock itself; publish only afterwards.
+    if standby.observe(&event, Instant::now())
+        && let Some(windows) = standby.publication()
+    {
+        service
+            .publish_suspended(&windows)
+            .map_err(|error| error.to_string())?;
     }
     let is_snapshot = matches!(&event, NiriEvent::WindowsChanged { .. });
     let closed_window = match &event {
@@ -1052,6 +1172,217 @@ fn ingest_stream_message(
         pending.ingest(&transition);
     }
     Ok(())
+}
+
+/// The controller loop's side of standby for one niri connection: what is
+/// suspended, reconciliation, and standby after minimizing.
+///
+/// No method here calls the `Service`; each one that takes the standby lock
+/// drops it before returning, so the caller may publish afterwards.
+struct StandbyLoop {
+    standby: SharedStandby,
+    games_path: PathBuf,
+    timers: StandbyTimers,
+    windows: BTreeMap<u64, NiriWindow>,
+    minimized: Vec<MinimizedWindow>,
+    minimized_suspended: BTreeSet<WindowId>,
+    reconciled: bool,
+    published: Option<Vec<SuspendedWindow>>,
+    rules_error: Option<String>,
+}
+
+impl StandbyLoop {
+    fn new(standby: SharedStandby, games_path: PathBuf) -> Self {
+        Self {
+            standby,
+            games_path,
+            timers: StandbyTimers::default(),
+            windows: BTreeMap::new(),
+            minimized: Vec::new(),
+            minimized_suspended: BTreeSet::new(),
+            reconciled: false,
+            published: None,
+            rules_error: None,
+        }
+    }
+
+    /// Tracks suspended flags, reconciles after the connection's first
+    /// window snapshot, and follows the minimized list. Returns whether the
+    /// event can change the suspended list.
+    fn observe(&mut self, event: &NiriEvent, now: Instant) -> bool {
+        match event {
+            NiriEvent::WindowsChanged { windows } => {
+                self.windows = windows
+                    .iter()
+                    .map(|window| (window.id, window.clone()))
+                    .collect();
+                if !self.reconciled {
+                    self.reconciled = true;
+                    self.reconcile();
+                }
+            }
+            NiriEvent::WindowOpenedOrChanged { window } => {
+                self.windows.insert(window.id, window.clone());
+            }
+            NiriEvent::WindowClosed { id } => {
+                self.windows.remove(&id.0);
+            }
+            NiriEvent::MinimizedWindowsChanged { windows, suspended } => {
+                self.minimized.clone_from(windows);
+                self.minimized_suspended.clone_from(suspended);
+                self.follow_minimized(now);
+            }
+            NiriEvent::WindowFocusChanged { .. } | NiriEvent::Ignored { .. } => return false,
+        }
+        true
+    }
+
+    /// The suspended list when it differs from the last one published.
+    fn publication(&mut self) -> Option<Vec<SuspendedWindow>> {
+        let windows: Vec<NiriWindow> = self.windows.values().cloned().collect();
+        let listed = suspended_windows(&windows, &self.minimized, &self.minimized_suspended);
+        if self.published.as_ref() == Some(&listed) {
+            return None;
+        }
+        self.published = Some(listed.clone());
+        Some(listed)
+    }
+
+    fn reconcile(&self) {
+        let lines = match LiveCompositor::connect() {
+            Ok(mut niri) => lock_standby(&self.standby).reconcile(&mut niri),
+            Err(error) => vec![format!("cannot reach niri: {error}")],
+        };
+        for line in lines {
+            outputln!("standby reconcile: {line}");
+        }
+    }
+
+    /// Restarts the timers from the minimized list and resumes each suspended
+    /// window that left it.
+    fn follow_minimized(&mut self, now: Instant) {
+        let rules = match GameRules::load(&self.games_path) {
+            Ok(rules) => {
+                self.rules_error = None;
+                Some(rules)
+            }
+            Err(error) => {
+                let error = error.to_string();
+                if self.rules_error.as_ref() != Some(&error) {
+                    errorln!("standby after minimizing is off: {error}");
+                    self.rules_error = Some(error);
+                }
+                None
+            }
+        };
+        let left = self
+            .timers
+            .update(now, &minimized_delays(rules.as_ref(), &self.minimized));
+        if left.is_empty() {
+            return;
+        }
+        let mut standby = lock_standby(&self.standby);
+        if !left.iter().any(|id| standby.is_suspended(*id)) {
+            return;
+        }
+        let mut niri = match LiveCompositor::connect() {
+            Ok(niri) => niri,
+            Err(error) => {
+                errorln!("cannot resume windows that left the minimized list: {error}");
+                return;
+            }
+        };
+        for id in left {
+            // Resuming one window resumes its whole game, so check each again.
+            if standby.is_suspended(id) {
+                let outcome = standby.resume(&mut niri, Some(id));
+                outputln!(
+                    "standby: window {id} left the minimized list: {}",
+                    standby_log_line(&outcome)
+                );
+            }
+        }
+    }
+
+    /// Suspends each minimized game whose delay has elapsed. Each window is
+    /// tried once per minimized period, so a refusal is logged once.
+    fn suspend_due(&mut self, now: Instant) {
+        let due = self.timers.due(now);
+        if due.is_empty() {
+            return;
+        }
+        let mut standby = lock_standby(&self.standby);
+        let mut niri = match LiveCompositor::connect() {
+            Ok(niri) => niri,
+            Err(error) => {
+                errorln!("cannot suspend minimized windows {due:?}: {error}");
+                return;
+            }
+        };
+        for id in due {
+            if standby.is_suspended(id) {
+                continue;
+            }
+            let outcome = standby.suspend(&mut niri, Some(id));
+            outputln!(
+                "standby after minimizing: window {id}: {}",
+                standby_log_line(&outcome)
+            );
+        }
+    }
+}
+
+/// The delay of each minimized window's game rule; none when the window is
+/// no game, its rule names no `standby_after`, or the rules are unusable.
+fn minimized_delays(
+    rules: Option<&GameRules>,
+    minimized: &[MinimizedWindow],
+) -> Vec<(u64, Option<Duration>)> {
+    minimized
+        .iter()
+        .map(|window| {
+            let delay = rules
+                .and_then(|rules| {
+                    rules.recognize(window.app_id.as_deref(), window.title.as_deref())
+                })
+                .and_then(|game| game.standby_after);
+            (window.id.0, delay)
+        })
+        .collect()
+}
+
+/// The windows niri reports suspended, visible or minimized, ascending by id.
+fn suspended_windows(
+    windows: &[NiriWindow],
+    minimized: &[MinimizedWindow],
+    minimized_suspended: &BTreeSet<WindowId>,
+) -> Vec<SuspendedWindow> {
+    let mut listed = BTreeMap::new();
+    for window in minimized
+        .iter()
+        .filter(|window| minimized_suspended.contains(&window.id))
+    {
+        listed.insert(
+            window.id.0,
+            SuspendedWindow {
+                id: window.id.0,
+                app_id: window.app_id.clone(),
+                title: window.title.clone(),
+            },
+        );
+    }
+    // A window in both lists is described by its visible record.
+    for window in windows.iter().filter(|window| window.is_suspended) {
+        listed.insert(
+            window.id,
+            SuspendedWindow {
+                id: window.id,
+                app_id: window.app_id.clone(),
+                title: window.title.clone(),
+            },
+        );
+    }
+    listed.into_values().collect()
 }
 
 const fn event_name(event: &NiriEvent) -> &'static str {
@@ -1129,19 +1460,26 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         fs,
         io::{self, Write},
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use super::{
-        Command, ConfigPoll, ConfigWatcher, describe_standby, parse_args, suspended_lines,
-        write_line,
+        Command, ConfigPoll, ConfigWatcher, describe_standby, minimized_delays, parse_args,
+        standby_action_result, suspended_lines, suspended_windows, write_line,
     };
     use melibea::{
-        protocol::{ActionResult, ActionStatus, Operation},
-        standby::{games::GameIdentity, ledger::LedgerEntry},
+        minimization::MinimizedWindow,
+        niri::NiriWindow,
+        protocol::{ActionResult, ActionStatus, Operation, SuspendedWindow},
+        standby::{
+            controller::{BlockReason, StandbyOperation, StandbyOutcome},
+            games::{GameIdentity, GameRules},
+            ledger::LedgerEntry,
+        },
         transition::WindowId,
     };
 
@@ -1374,6 +1712,156 @@ mod tests {
             )),
             Err("not_a_game: nope".to_owned())
         );
+    }
+
+    fn niri_window(id: u64, is_suspended: bool) -> NiriWindow {
+        NiriWindow {
+            id,
+            title: Some(format!("window {id}")),
+            app_id: Some("steam_app_1".to_owned()),
+            pid: Some(10),
+            is_focused: false,
+            is_floating: false,
+            is_suspended,
+        }
+    }
+
+    fn minimized_window(id: u64) -> MinimizedWindow {
+        MinimizedWindow {
+            id: WindowId(id),
+            app_id: Some("steam_app_2".to_owned()),
+            title: Some(format!("minimized {id}")),
+        }
+    }
+
+    #[test]
+    fn suspended_windows_merge_visible_and_minimized_flags_by_id() {
+        let windows = [
+            niri_window(30, true),
+            niri_window(10, false),
+            niri_window(20, true),
+        ];
+        let minimized = [
+            minimized_window(25),
+            minimized_window(5),
+            minimized_window(40),
+        ];
+        let flagged = BTreeSet::from([WindowId(25), WindowId(5)]);
+
+        let listed = suspended_windows(&windows, &minimized, &flagged);
+
+        assert_eq!(
+            listed,
+            vec![
+                SuspendedWindow {
+                    id: 5,
+                    app_id: Some("steam_app_2".to_owned()),
+                    title: Some("minimized 5".to_owned()),
+                },
+                SuspendedWindow {
+                    id: 20,
+                    app_id: Some("steam_app_1".to_owned()),
+                    title: Some("window 20".to_owned()),
+                },
+                SuspendedWindow {
+                    id: 25,
+                    app_id: Some("steam_app_2".to_owned()),
+                    title: Some("minimized 25".to_owned()),
+                },
+                SuspendedWindow {
+                    id: 30,
+                    app_id: Some("steam_app_1".to_owned()),
+                    title: Some("window 30".to_owned()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn suspended_windows_list_a_window_reported_twice_once() {
+        let windows = [niri_window(7, true)];
+        let minimized = [minimized_window(7)];
+        let flagged = BTreeSet::from([WindowId(7)]);
+
+        let listed = suspended_windows(&windows, &minimized, &flagged);
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, 7);
+    }
+
+    #[test]
+    fn suspended_windows_are_empty_when_nothing_is_flagged() {
+        let listed = suspended_windows(
+            &[niri_window(1, false)],
+            &[minimized_window(2)],
+            &BTreeSet::new(),
+        );
+        assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn standby_results_report_the_requested_id_and_the_performed_operation() {
+        let applied = StandbyOutcome::Applied {
+            operation: StandbyOperation::Resume,
+            window_id: 608,
+            windows: vec![608],
+        };
+        let result = standby_action_result(&applied, None);
+        assert_eq!(result.operation, Operation::Resume);
+        assert_eq!(result.requested_id, None);
+        assert_eq!(result.window_id, Some(608));
+        assert_eq!(result.status, ActionStatus::Applied);
+
+        let blocked = StandbyOutcome::Blocked {
+            operation: StandbyOperation::Suspend,
+            window_id: Some(608),
+            reason: BlockReason::NotAGame,
+        };
+        let result = standby_action_result(&blocked, Some(608));
+        assert_eq!(result.operation, Operation::Suspend);
+        assert_eq!(result.requested_id, Some(608));
+        assert_eq!(result.window_id, Some(608));
+        assert_eq!(result.status, ActionStatus::Blocked);
+        assert!(
+            result
+                .reason
+                .is_some_and(|reason| reason.starts_with("not_a_game"))
+        );
+    }
+
+    #[test]
+    fn minimized_games_get_the_delay_of_their_rule() {
+        let rules = GameRules::parse(
+            r#"
+                [[game]]
+                app_id = "^steam_proton$"
+                title = "^Victoria 3$"
+                process = "victoria3.exe"
+                standby_after = "5m"
+            "#,
+        )
+        .expect("valid rules");
+        let game = MinimizedWindow {
+            id: WindowId(1),
+            app_id: Some("steam_proton".to_owned()),
+            title: Some("Victoria 3".to_owned()),
+        };
+        let steam = MinimizedWindow {
+            id: WindowId(2),
+            app_id: Some("steam_app_42".to_owned()),
+            title: None,
+        };
+        let other = MinimizedWindow {
+            id: WindowId(3),
+            app_id: Some("kitty".to_owned()),
+            title: None,
+        };
+
+        assert_eq!(
+            minimized_delays(Some(&rules), &[game.clone(), steam, other]),
+            vec![(1, Some(Duration::from_secs(300))), (2, None), (3, None)]
+        );
+        assert_eq!(minimized_delays(None, &[game]), vec![(1, None)]);
     }
 
     #[test]
