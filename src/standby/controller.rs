@@ -16,6 +16,7 @@ use super::ledger::{Ledger, LedgerEntry};
 use super::process::{ProcessInfo, ProcessTable, app_unit};
 use super::systemd::{FreezerState, Systemd, game_unit_name, is_game_unit};
 use crate::niri_ipc::{NiriActionClient, NiriActionError, NiriWindowActionStatus};
+use crate::protocol::{ActionResult, ActionStatus, Operation};
 use crate::transition::WindowId;
 
 /// How long moved pids may take to report their new unit in `/proc`.
@@ -198,6 +199,63 @@ impl BlockReason {
             Self::Ledger(text) => format!("ledger: {text}"),
             Self::Compositor(text) => format!("niri: {text}"),
         }
+    }
+}
+
+/// Maps a standby outcome onto the protocol's action result.
+///
+/// The outcome does not keep the id the client sent when it named none, so
+/// `requested_id` carries the resolved window (the requested id when the
+/// window was not found).
+#[must_use]
+pub fn outcome_result(outcome: &StandbyOutcome) -> ActionResult {
+    let operation_of = |operation: StandbyOperation| match operation {
+        StandbyOperation::Suspend => Operation::Suspend,
+        StandbyOperation::Resume => Operation::Resume,
+    };
+    match outcome {
+        StandbyOutcome::Applied {
+            operation,
+            window_id,
+            ..
+        } => ActionResult {
+            operation: operation_of(*operation),
+            requested_id: Some(*window_id),
+            window_id: Some(*window_id),
+            status: ActionStatus::Applied,
+            reason: None,
+        },
+        StandbyOutcome::AlreadyInRequestedState {
+            operation,
+            window_id,
+        } => ActionResult {
+            operation: operation_of(*operation),
+            requested_id: Some(*window_id),
+            window_id: Some(*window_id),
+            status: ActionStatus::AlreadyInRequestedState,
+            reason: None,
+        },
+        StandbyOutcome::WindowNotFound {
+            operation,
+            requested_id,
+        } => ActionResult {
+            operation: operation_of(*operation),
+            requested_id: *requested_id,
+            window_id: None,
+            status: ActionStatus::WindowNotFound,
+            reason: None,
+        },
+        StandbyOutcome::Blocked {
+            operation,
+            window_id,
+            reason,
+        } => ActionResult {
+            operation: operation_of(*operation),
+            requested_id: *window_id,
+            window_id: *window_id,
+            status: ActionStatus::Blocked,
+            reason: Some(format!("{}: {}", reason.code(), reason.describe())),
+        },
     }
 }
 
@@ -1996,5 +2054,54 @@ mod tests {
             assert_eq!(reason.code(), code);
             assert!(!reason.describe().is_empty());
         }
+    }
+
+    #[test]
+    fn blocked_outcome_carries_the_reason() {
+        use crate::protocol::{
+            ActionStatus, Message, Operation, PROTOCOL_VERSION_V3, ServerMessage,
+        };
+
+        let blocked = outcome_result(&StandbyOutcome::Blocked {
+            operation: StandbyOperation::Suspend,
+            window_id: Some(7),
+            reason: BlockReason::NotAGame,
+        });
+        assert_eq!(blocked.operation, Operation::Suspend);
+        assert_eq!(blocked.status, ActionStatus::Blocked);
+        let wire = serde_json::to_string(&ServerMessage::for_version(
+            PROTOCOL_VERSION_V3,
+            Message::ActionResult(blocked),
+        ))
+        .expect("serialize");
+        assert!(
+            wire.contains(
+                r#""status":"blocked","reason":"not_a_game: the window is not a recognized game""#
+            ),
+            "{wire}"
+        );
+
+        let missing = outcome_result(&StandbyOutcome::WindowNotFound {
+            operation: StandbyOperation::Resume,
+            requested_id: Some(9),
+        });
+        assert_eq!(missing.operation, Operation::Resume);
+        assert_eq!(missing.status, ActionStatus::WindowNotFound);
+        assert_eq!(missing.requested_id, Some(9));
+        assert_eq!(missing.window_id, None);
+        assert_eq!(missing.reason, None);
+
+        let applied = outcome_result(&StandbyOutcome::Applied {
+            operation: StandbyOperation::Suspend,
+            window_id: 7,
+            windows: vec![7, 8],
+        });
+        assert_eq!(applied.status, ActionStatus::Applied);
+        assert_eq!(applied.window_id, Some(7));
+        let already = outcome_result(&StandbyOutcome::AlreadyInRequestedState {
+            operation: StandbyOperation::Resume,
+            window_id: 7,
+        });
+        assert_eq!(already.status, ActionStatus::AlreadyInRequestedState);
     }
 }

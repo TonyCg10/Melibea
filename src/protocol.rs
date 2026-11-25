@@ -8,8 +8,11 @@ use crate::minimization::MinimizedWindow;
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Protocol version that adds action-scoped window transition hints.
 pub const PROTOCOL_VERSION_V2: u32 = 2;
+/// Protocol version that adds suspend, resume and the suspended-window list.
+pub const PROTOCOL_VERSION_V3: u32 = 3;
 /// Every protocol version accepted by this daemon, in ascending order.
-pub const SUPPORTED_PROTOCOL_VERSIONS: [u32; 2] = [PROTOCOL_VERSION, PROTOCOL_VERSION_V2];
+pub const SUPPORTED_PROTOCOL_VERSIONS: [u32; 3] =
+    [PROTOCOL_VERSION, PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3];
 
 /// Maximum UTF-8 byte length accepted for a compositor output name.
 pub const MAX_OUTPUT_NAME_BYTES: usize = 256;
@@ -38,6 +41,16 @@ impl ClientRequest {
     pub const fn v2(request: Request) -> Self {
         Self {
             version: PROTOCOL_VERSION_V2,
+            request,
+        }
+    }
+
+    /// Creates a protocol-v3 request. Version 3 accepts everything version 2
+    /// does and adds suspension.
+    #[must_use]
+    pub const fn v3(request: Request) -> Self {
+        Self {
+            version: PROTOCOL_VERSION_V3,
             request,
         }
     }
@@ -84,6 +97,20 @@ pub enum Request {
     Close {
         window_id: u64,
     },
+    /// Version 3: suspend the named window's game, or the focused window's.
+    Suspend {
+        window_id: Option<u64>,
+    },
+    /// Version 3: resume the named window's game, or the focused window's.
+    Resume {
+        window_id: Option<u64>,
+    },
+    /// Version 3: suspend a running game, resume a suspended one.
+    ToggleSuspend {
+        window_id: Option<u64>,
+    },
+    /// Version 3: ask for the current suspended-window list.
+    ListSuspended,
 }
 
 /// Deserializes a transition only when the field contains a real transition.
@@ -142,11 +169,31 @@ impl Request {
     }
 
     fn validate_for_version(&self, version: u32) -> Result<(), ProtocolError> {
+        if version < PROTOCOL_VERSION_V3
+            && matches!(
+                self,
+                Self::Suspend { .. }
+                    | Self::Resume { .. }
+                    | Self::ToggleSuspend { .. }
+                    | Self::ListSuspended
+            )
+        {
+            return Err(ProtocolError::invalid_request(
+                "suspension requires Melibea protocol version 3",
+            ));
+        }
+
         let transition = match self {
             Self::Minimize { transition, .. } | Self::Restore { transition, .. } => {
                 transition.as_ref()
             }
-            Self::List | Self::Subscribe | Self::Close { .. } => None,
+            Self::List
+            | Self::Subscribe
+            | Self::Close { .. }
+            | Self::Suspend { .. }
+            | Self::Resume { .. }
+            | Self::ToggleSuspend { .. }
+            | Self::ListSuspended => None,
         };
 
         if version == PROTOCOL_VERSION && transition.is_some() {
@@ -329,6 +376,12 @@ pub enum Message {
     },
     /// Result accepted from niri for one requested operation.
     ActionResult(ActionResult),
+    /// Version 3: the windows currently suspended, with the broker's own
+    /// revision (independent of the minimized-window revision).
+    Suspended {
+        revision: u64,
+        windows: Vec<SuspendedWindow>,
+    },
     /// The daemon is connected but has no current authoritative niri snapshot.
     Unavailable { revision: u64, reason: String },
     /// Invalid request, incompatible version, or failed operation.
@@ -355,6 +408,14 @@ impl From<&MinimizedWindow> for Window {
             icon_name: None,
         }
     }
+}
+
+/// One window of a suspended game.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SuspendedWindow {
+    pub id: u64,
+    pub app_id: Option<String>,
+    pub title: Option<String>,
 }
 
 /// Sequential change within one atomic revision.
@@ -387,6 +448,8 @@ pub enum Operation {
     Minimize,
     Restore,
     Close,
+    Suspend,
+    Resume,
 }
 
 /// Semantic result forwarded from niri without claiming more lifecycle work
@@ -397,6 +460,10 @@ pub struct ActionResult {
     pub requested_id: Option<u64>,
     pub window_id: Option<u64>,
     pub status: ActionStatus,
+    /// Why a `blocked` result changed nothing; absent otherwise and never
+    /// serialized at protocol versions 1 and 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Stable Melibea spelling of niri's window action statuses.
@@ -428,7 +495,7 @@ impl ProtocolError {
         Self {
             code: ErrorCode::IncompatibleVersion,
             message: format!(
-                "unsupported Melibea protocol version {requested}; supported versions are 1 and 2"
+                "unsupported Melibea protocol version {requested}; supported versions are 1, 2 and 3"
             ),
             supported_versions: SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
         }
@@ -526,8 +593,10 @@ pub fn diff_windows(previous: &[Window], next: &[Window]) -> Vec<WindowChange> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BubbleAnchor, BubbleAnchorError, ClientRequest, ErrorCode, PROTOCOL_VERSION,
-        PROTOCOL_VERSION_V2, Request, Window, WindowChange, WindowTransition, diff_windows,
+        ActionResult, ActionStatus, BubbleAnchor, BubbleAnchorError, ClientRequest, ErrorCode,
+        Message, Operation, PROTOCOL_VERSION, PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3,
+        ProtocolError, Request, ServerMessage, SuspendedWindow, Window, WindowChange,
+        WindowTransition, diff_windows,
     };
 
     fn window(id: u64, title: &str) -> Window {
@@ -653,6 +722,104 @@ mod tests {
                     window: window(4, "four"),
                 },
             ]
+        );
+    }
+
+    fn applied_minimize() -> ActionResult {
+        ActionResult {
+            operation: Operation::Minimize,
+            requested_id: Some(42),
+            window_id: Some(42),
+            status: ActionStatus::Applied,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn v1_and_v2_results_have_no_reason_key() {
+        let golden = |version: u32| {
+            format!(
+                r#"{{"version":{version},"message":{{"type":"action_result","operation":"minimize","requested_id":42,"window_id":42,"status":"applied"}}}}"#
+            )
+        };
+        for version in [PROTOCOL_VERSION, PROTOCOL_VERSION_V2] {
+            let message =
+                ServerMessage::for_version(version, Message::ActionResult(applied_minimize()));
+            assert_eq!(
+                serde_json::to_string(&message).expect("serialize result"),
+                golden(version)
+            );
+        }
+    }
+
+    #[test]
+    fn incompatible_version_lists_three_versions() {
+        let error = ClientRequest {
+            version: 9,
+            request: Request::List,
+        }
+        .validate()
+        .expect_err("version 9 is unsupported");
+
+        assert_eq!(error.code, ErrorCode::IncompatibleVersion);
+        assert_eq!(error.supported_versions, vec![1, 2, 3]);
+        assert_eq!(
+            error.message,
+            "unsupported Melibea protocol version 9; supported versions are 1, 2 and 3"
+        );
+        assert_eq!(error, ProtocolError::incompatible(9));
+    }
+
+    #[test]
+    fn suspension_requests_are_valid_only_at_version_three() {
+        let requests = [
+            Request::Suspend { window_id: Some(7) },
+            Request::Resume { window_id: None },
+            Request::ToggleSuspend { window_id: None },
+            Request::ListSuspended,
+        ];
+        for request in requests {
+            for version in [PROTOCOL_VERSION, PROTOCOL_VERSION_V2] {
+                let error = ClientRequest {
+                    version,
+                    request: request.clone(),
+                }
+                .validate()
+                .expect_err("suspension needs v3");
+                assert_eq!(error.code, ErrorCode::InvalidRequest);
+                assert_eq!(
+                    error.message,
+                    "suspension requires Melibea protocol version 3"
+                );
+            }
+            ClientRequest::v3(request).validate().expect("valid at v3");
+        }
+        ClientRequest::v3(Request::minimize(None))
+            .validate()
+            .expect("v3 accepts everything v2 does");
+    }
+
+    #[test]
+    fn suspension_wire_shapes_are_exact() {
+        let toggle = ClientRequest::v3(Request::ToggleSuspend { window_id: None });
+        assert_eq!(
+            serde_json::to_string(&toggle).expect("serialize"),
+            r#"{"version":3,"request":{"type":"toggle_suspend","window_id":null}}"#
+        );
+        let list = ServerMessage::for_version(
+            PROTOCOL_VERSION_V3,
+            Message::Suspended {
+                revision: 1,
+                windows: vec![SuspendedWindow {
+                    id: 608,
+                    app_id: Some("steam_app_1".to_owned()),
+                    title: None,
+                }],
+            },
+        );
+        assert_eq!(
+            serde_json::to_string(&list).expect("serialize"),
+            r#"{"version":3,"message":{"type":"suspended","revision":1,"windows":[{"id":608,"app_id":"steam_app_1","title":null}]}}"#
         );
     }
 }

@@ -22,6 +22,12 @@ use melibea::{
         ActionResult, ActionStatus, Message as ProtocolMessage, Operation, Request, ServerMessage,
     },
     service::{Service, ServiceClient, socket_path},
+    standby::{
+        controller::{LiveCompositor, ProcFs, Standby},
+        games::default_games_path,
+        ledger::{Ledger, LedgerEntry},
+        systemd::SystemdTools,
+    },
     transition::{DecisionOutcome, ExclusionReason, FocusState, FocusTransition, WindowId},
 };
 
@@ -58,6 +64,16 @@ fn main() -> ExitCode {
         Ok(Command::Minimize { id }) => service_action(Request::minimize(id.map(|id| id.0))),
         Ok(Command::Restore { id }) => service_action(Request::restore(id.0)),
         Ok(Command::Close { id }) => service_action(Request::Close { window_id: id.0 }),
+        Ok(Command::Suspend { id }) => service_standby(Request::Suspend {
+            window_id: id.map(|id| id.0),
+        }),
+        Ok(Command::Resume { id }) => service_standby(Request::Resume {
+            window_id: id.map(|id| id.0),
+        }),
+        Ok(Command::ToggleSuspend { id }) => service_standby(Request::ToggleSuspend {
+            window_id: id.map(|id| id.0),
+        }),
+        Ok(Command::ThawAll) => thaw_all(),
         Ok(Command::Subscribe) => service_subscribe(),
         Ok(Command::Help) => {
             print_help();
@@ -82,6 +98,10 @@ enum Command {
     Minimize { id: Option<WindowId> },
     Restore { id: WindowId },
     Close { id: WindowId },
+    Suspend { id: Option<WindowId> },
+    Resume { id: Option<WindowId> },
+    ToggleSuspend { id: Option<WindowId> },
+    ThawAll,
     Subscribe,
     Help,
 }
@@ -138,12 +158,32 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command, St
         }
         "minimize" => {
             reject_config(command, config_path.as_ref())?;
-            let id = match operands {
-                [] => None,
-                [id] => Some(parse_window_id(command, id)?),
-                _ => return Err(format!("`{command}` accepts at most one window id")),
-            };
-            Ok(Command::Minimize { id })
+            Ok(Command::Minimize {
+                id: optional_window_id(command, operands)?,
+            })
+        }
+        "suspend" => {
+            reject_config(command, config_path.as_ref())?;
+            Ok(Command::Suspend {
+                id: optional_window_id(command, operands)?,
+            })
+        }
+        "resume" => {
+            reject_config(command, config_path.as_ref())?;
+            Ok(Command::Resume {
+                id: optional_window_id(command, operands)?,
+            })
+        }
+        "toggle-suspend" => {
+            reject_config(command, config_path.as_ref())?;
+            Ok(Command::ToggleSuspend {
+                id: optional_window_id(command, operands)?,
+            })
+        }
+        "thaw-all" => {
+            reject_config(command, config_path.as_ref())?;
+            require_no_operands(command, operands)?;
+            Ok(Command::ThawAll)
         }
         "restore" => {
             reject_config(command, config_path.as_ref())?;
@@ -184,6 +224,14 @@ fn require_no_operands(command: &str, operands: &[String]) -> Result<(), String>
         Err(format!("unexpected argument for `{command}`: {value}"))
     } else {
         Ok(())
+    }
+}
+
+fn optional_window_id(command: &str, operands: &[String]) -> Result<Option<WindowId>, String> {
+    match operands {
+        [] => Ok(None),
+        [id] => parse_window_id(command, id).map(Some),
+        _ => Err(format!("`{command}` accepts at most one window id")),
     }
 }
 
@@ -393,8 +441,41 @@ fn status_inner(path: Option<PathBuf>) -> Result<(), String> {
     for (index, matches) in report.matches_per_rule.iter().enumerate() {
         outputln!("rule={index} tiled-matches={matches}");
     }
+    for line in suspended_status_lines() {
+        outputln!("{line}");
+    }
 
     Ok(())
+}
+
+/// The `suspended:` section of `status`, read straight from the ledger. A
+/// missing ledger and an empty one print nothing, so the output is unchanged
+/// when nothing is suspended.
+fn suspended_status_lines() -> Vec<String> {
+    let Ok(path) = Ledger::default_path() else {
+        return Vec::new();
+    };
+    match Ledger::at(path).read() {
+        Ok(entries) => suspended_lines(&entries),
+        Err(error) => vec![format!("suspended: cannot read the ledger: {error}")],
+    }
+}
+
+fn suspended_lines(entries: &[LedgerEntry]) -> Vec<String> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!("suspended: {} game(s)", entries.len())];
+    lines.extend(entries.iter().map(|entry| {
+        format!(
+            "suspended game={:?} windows={:?} units={} since={}",
+            entry.identity,
+            entry.windows,
+            entry.units.join(","),
+            entry.since_unix
+        )
+    }));
+    lines
 }
 
 fn service_list() -> ExitCode {
@@ -465,6 +546,108 @@ fn service_action(request: Request) -> ExitCode {
     }
 }
 
+fn service_standby(request: Request) -> ExitCode {
+    let response = ServiceClient::from_environment()
+        .map_err(|error| error.to_string())
+        .and_then(|client| {
+            client
+                .request_v3(request)
+                .map_err(|error| error.to_string())
+        });
+    match response {
+        Ok(ServerMessage {
+            message: ProtocolMessage::ActionResult(result),
+            ..
+        }) => match describe_standby(&result) {
+            Ok(line) => {
+                outputln!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(reason) => {
+                errorln!("{reason}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(message) => protocol_failure(message),
+        Err(error) => {
+            errorln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The terminal line for a standby result, or the failure text for stderr.
+///
+/// Note: the protocol result names one window, so the "and N more" of a game
+/// with several windows is not shown.
+fn describe_standby(result: &ActionResult) -> Result<String, String> {
+    let window = result
+        .window_id
+        .or(result.requested_id)
+        .map_or_else(|| "focused".to_owned(), |id| id.to_string());
+    match (result.status, result.operation) {
+        (ActionStatus::Applied, Operation::Suspend) => Ok(format!("suspended window {window}")),
+        (ActionStatus::Applied, Operation::Resume) => Ok(format!("resumed window {window}")),
+        (ActionStatus::AlreadyInRequestedState, Operation::Suspend) => {
+            Ok(format!("window {window} is already suspended"))
+        }
+        (ActionStatus::AlreadyInRequestedState, Operation::Resume) => {
+            Ok(format!("window {window} is not suspended"))
+        }
+        (ActionStatus::WindowNotFound, _) => Err(format!("window {window} not found")),
+        (ActionStatus::Blocked, _) => Err(result
+            .reason
+            .clone()
+            .unwrap_or_else(|| "blocked".to_owned())),
+        (status, operation) => Ok(format!(
+            "operation={} status={}",
+            operation_name(operation),
+            action_status_name(status)
+        )),
+    }
+}
+
+/// Thaws every game locally; the daemon is not needed.
+fn thaw_all() -> ExitCode {
+    let games_path = match default_games_path() {
+        Ok(path) => path,
+        Err(error) => {
+            errorln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let ledger = match Ledger::default_path() {
+        Ok(path) => Ledger::at(path),
+        Err(error) => {
+            errorln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let uid = match fs::metadata("/proc/self") {
+        Ok(metadata) => std::os::unix::fs::MetadataExt::uid(&metadata),
+        Err(error) => {
+            errorln!("cannot read /proc/self: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut standby = Standby::new(
+        SystemdTools::new(),
+        ProcFs,
+        ledger,
+        games_path,
+        std::process::id(),
+        uid,
+    );
+    let lines = match NiriActionClient::connect() {
+        Ok(client) => standby.thaw_all(Some(&mut LiveCompositor::new(client))),
+        Err(_) => standby.thaw_all(None::<&mut LiveCompositor>),
+    };
+    for line in lines {
+        outputln!("{line}");
+    }
+    ExitCode::SUCCESS
+}
+
 fn service_subscribe() -> ExitCode {
     let client = match ServiceClient::from_environment() {
         Ok(client) => client,
@@ -520,6 +703,8 @@ const fn operation_name(operation: Operation) -> &'static str {
         Operation::Minimize => "minimize",
         Operation::Restore => "restore",
         Operation::Close => "close",
+        Operation::Suspend => "suspend",
+        Operation::Resume => "resume",
     }
 }
 
@@ -564,7 +749,11 @@ fn execute_protocol_action(request: &Request) -> Result<ActionResult, String> {
         Request::Close { window_id } => {
             (Operation::Close, client.close_window(WindowId(*window_id)))
         }
-        Request::List | Request::Subscribe => {
+        Request::Suspend { .. } | Request::Resume { .. } | Request::ToggleSuspend { .. } => {
+            // Task 12 replaces this executor with the standby controller.
+            return Err("suspension is not wired into this daemon yet".to_owned());
+        }
+        Request::List | Request::Subscribe | Request::ListSuspended => {
             return Err("request is not a compositor action".to_owned());
         }
     };
@@ -587,6 +776,7 @@ fn map_native_action_result(operation: Operation, result: &NiriWindowActionResul
         requested_id: result.requested_id,
         window_id: result.window_id,
         status,
+        reason: None,
     }
 }
 
@@ -932,7 +1122,7 @@ const fn exclusion_name(reason: ExclusionReason) -> &'static str {
 
 fn print_help() {
     outputln!(
-        "Usage: melibea [--config PATH] <COMMAND> [WINDOW_ID]\n\nCommands:\n  check-config        Parse and validate configuration without contacting niri\n  observe             Explain live focus decisions without changing niri layout\n  run                 Run geometry policy and the local protocol service\n  status              Check configuration and current niri state without mutation\n  list                List minimized windows through the Melibea v1 service\n  minimize [ID]       Minimize a window, or the focused window when ID is omitted\n  restore ID          Restore one native minimized window\n  close ID            Request that niri close one minimized window\n  subscribe           Print snapshot and incremental events as JSON lines\n  help                Show this help\n\nCompatibility aliases: minimized=list, close-window=close"
+        "Usage: melibea [--config PATH] <COMMAND> [WINDOW_ID]\n\nCommands:\n  check-config        Parse and validate configuration without contacting niri\n  observe             Explain live focus decisions without changing niri layout\n  run                 Run geometry policy and the local protocol service\n  status              Check configuration and current niri state without mutation\n  list                List minimized windows through the Melibea v1 service\n  minimize [ID]       Minimize a window, or the focused window when ID is omitted\n  restore ID          Restore one native minimized window\n  close ID            Request that niri close one minimized window\n  suspend [ID]        Suspend a game (freeze its processes), or the focused window's game\n  resume [ID]         Resume a suspended game, or the focused window's game\n  toggle-suspend [ID] Suspend a running game or resume a suspended one\n  thaw-all            Thaw every suspended game and clear the flags, without the daemon\n  subscribe           Print snapshot and incremental events as JSON lines\n  help                Show this help\n\nCompatibility aliases: minimized=list, close-window=close"
     );
 }
 
@@ -945,8 +1135,15 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{Command, ConfigPoll, ConfigWatcher, parse_args, write_line};
-    use melibea::transition::WindowId;
+    use super::{
+        Command, ConfigPoll, ConfigWatcher, describe_standby, parse_args, suspended_lines,
+        write_line,
+    };
+    use melibea::{
+        protocol::{ActionResult, ActionStatus, Operation},
+        standby::{games::GameIdentity, ledger::LedgerEntry},
+        transition::WindowId,
+    };
 
     struct BrokenWriter;
 
@@ -1103,6 +1300,79 @@ mod tests {
         assert_eq!(
             parse_args(args(&["minimize", "--config", "unused.toml"])),
             Err("`minimize` does not accept `--config`".to_owned())
+        );
+    }
+
+    #[test]
+    fn parses_standby_commands() {
+        assert_eq!(
+            parse_args(args(&["toggle-suspend"])),
+            Ok(Command::ToggleSuspend { id: None })
+        );
+        assert_eq!(
+            parse_args(args(&["suspend", "7"])),
+            Ok(Command::Suspend {
+                id: Some(WindowId(7))
+            })
+        );
+        assert_eq!(
+            parse_args(args(&["resume"])),
+            Ok(Command::Resume { id: None })
+        );
+        assert_eq!(parse_args(args(&["thaw-all"])), Ok(Command::ThawAll));
+        assert_eq!(
+            parse_args(args(&["suspend", "7", "8"])),
+            Err("`suspend` accepts at most one window id".to_owned())
+        );
+        assert_eq!(
+            parse_args(args(&["thaw-all", "7"])),
+            Err("unexpected argument for `thaw-all`: 7".to_owned())
+        );
+        assert_eq!(
+            parse_args(args(&["resume", "--config", "unused.toml"])),
+            Err("`resume` does not accept `--config`".to_owned())
+        );
+    }
+
+    #[test]
+    fn status_lists_suspended_games_and_nothing_when_none() {
+        assert!(suspended_lines(&[]).is_empty());
+        let entry = LedgerEntry {
+            units: vec!["app-melibea-game-1.scope".to_owned()],
+            windows: vec![608, 609],
+            identity: GameIdentity::SteamApp { app_id: 42 },
+            since_unix: 1,
+            flagged: true,
+        };
+        let lines = suspended_lines(&[entry]);
+        assert_eq!(lines[0], "suspended: 1 game(s)");
+        assert!(lines[1].contains("windows=[608, 609]"), "{lines:?}");
+    }
+
+    #[test]
+    fn standby_results_are_described_for_the_terminal() {
+        let result = |operation, status, reason: Option<&str>| ActionResult {
+            operation,
+            requested_id: Some(608),
+            window_id: Some(608),
+            status,
+            reason: reason.map(str::to_owned),
+        };
+        assert_eq!(
+            describe_standby(&result(Operation::Suspend, ActionStatus::Applied, None)),
+            Ok("suspended window 608".to_owned())
+        );
+        assert_eq!(
+            describe_standby(&result(Operation::Resume, ActionStatus::Applied, None)),
+            Ok("resumed window 608".to_owned())
+        );
+        assert_eq!(
+            describe_standby(&result(
+                Operation::Suspend,
+                ActionStatus::Blocked,
+                Some("not_a_game: nope")
+            )),
+            Err("not_a_game: nope".to_owned())
         );
     }
 

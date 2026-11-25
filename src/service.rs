@@ -22,8 +22,8 @@ use std::{
 use crate::{
     minimization::MinimizedWindow,
     protocol::{
-        ActionResult, ClientRequest, Message, PROTOCOL_VERSION, ProtocolError, Request,
-        SUPPORTED_PROTOCOL_VERSIONS, ServerMessage, Window, diff_windows,
+        ActionResult, ClientRequest, Message, PROTOCOL_VERSION, PROTOCOL_VERSION_V3, ProtocolError,
+        Request, SUPPORTED_PROTOCOL_VERSIONS, ServerMessage, SuspendedWindow, Window, diff_windows,
     },
 };
 
@@ -163,6 +163,20 @@ impl Service {
     pub fn set_unavailable(&self, reason: impl Into<String>) -> Result<(), ServiceStopped> {
         self.send_synchronized(|acknowledged| BrokerMessage::SetUnavailable {
             reason: reason.into(),
+            acknowledged,
+        })
+    }
+
+    /// Publishes the windows of suspended games. An identical list changes
+    /// nothing; otherwise the suspended revision advances and version-3
+    /// subscribers receive the new list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the broker has stopped.
+    pub fn publish_suspended(&self, windows: &[SuspendedWindow]) -> Result<(), ServiceStopped> {
+        self.send_synchronized(|acknowledged| BrokerMessage::PublishSuspended {
+            windows: windows.to_vec(),
             acknowledged,
         })
     }
@@ -386,6 +400,10 @@ enum BrokerMessage {
         reason: String,
         acknowledged: SyncSender<()>,
     },
+    PublishSuspended {
+        windows: Vec<SuspendedWindow>,
+        acknowledged: SyncSender<()>,
+    },
     Client {
         version: u32,
         request: Request,
@@ -399,6 +417,8 @@ struct BrokerState {
     ready: bool,
     unavailable_reason: String,
     windows: Vec<Window>,
+    suspended_revision: u64,
+    suspended: Vec<SuspendedWindow>,
     subscribers: Vec<Subscriber>,
 }
 
@@ -414,6 +434,8 @@ impl Default for BrokerState {
             ready: false,
             unavailable_reason: "awaiting authoritative niri snapshot".to_owned(),
             windows: Vec::new(),
+            suspended_revision: 0,
+            suspended: Vec::new(),
             subscribers: Vec::new(),
         }
     }
@@ -435,6 +457,13 @@ fn broker_loop(receiver: &Receiver<BrokerMessage>, executor: &Arc<impl ActionExe
                 acknowledged,
             } => {
                 state.set_unavailable(reason);
+                let _ = acknowledged.send(());
+            }
+            BrokerMessage::PublishSuspended {
+                windows,
+                acknowledged,
+            } => {
+                state.publish_suspended(windows);
                 let _ = acknowledged.send(());
             }
             BrokerMessage::Client {
@@ -468,6 +497,30 @@ impl BrokerState {
             None => self.snapshot_message(),
         };
         self.broadcast(&message);
+    }
+
+    fn publish_suspended(&mut self, windows: Vec<SuspendedWindow>) {
+        if self.suspended == windows {
+            return;
+        }
+        self.suspended_revision = self.suspended_revision.saturating_add(1);
+        self.suspended = windows;
+        let message = self.suspended_message();
+        self.subscribers.retain_mut(|subscriber| {
+            subscriber.version < PROTOCOL_VERSION_V3
+                || write_message(
+                    &mut subscriber.stream,
+                    &ServerMessage::for_version(subscriber.version, message.clone()),
+                )
+                .is_ok()
+        });
+    }
+
+    fn suspended_message(&self) -> Message {
+        Message::Suspended {
+            revision: self.suspended_revision,
+            windows: self.suspended.clone(),
+        }
     }
 
     fn set_unavailable(&mut self, reason: String) {
@@ -507,9 +560,16 @@ impl BrokerState {
                         reason: self.unavailable_reason.clone(),
                     }
                 };
-                if write_message(stream, &ServerMessage::for_version(version, message)).is_ok()
-                    && let Ok(subscriber) = stream.try_clone()
-                {
+                let mut sent =
+                    write_message(stream, &ServerMessage::for_version(version, message)).is_ok();
+                if sent && version >= PROTOCOL_VERSION_V3 {
+                    sent = write_message(
+                        stream,
+                        &ServerMessage::for_version(version, self.suspended_message()),
+                    )
+                    .is_ok();
+                }
+                if sent && let Ok(subscriber) = stream.try_clone() {
                     // The set only grows here, so bounding it here bounds it
                     // always: a client that reconnects clears its own corpses.
                     self.sweep_departed();
@@ -519,9 +579,18 @@ impl BrokerState {
                     });
                 }
             }
+            Request::ListSuspended => {
+                let _ = write_message(
+                    stream,
+                    &ServerMessage::for_version(version, self.suspended_message()),
+                );
+            }
             action @ (Request::Minimize { .. }
             | Request::Restore { .. }
-            | Request::Close { .. }) => {
+            | Request::Close { .. }
+            | Request::Suspend { .. }
+            | Request::Resume { .. }
+            | Request::ToggleSuspend { .. }) => {
                 let message = match executor.execute(&action) {
                     Ok(result) => Message::ActionResult(result),
                     Err(error) => Message::Error(ProtocolError::action_failed(error)),
@@ -646,6 +715,16 @@ impl ServiceClient {
         self.request_versioned(&ClientRequest::v2(request))
     }
 
+    /// Sends one protocol-v3 request and reads exactly one v3 response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for connection, encoding, I/O, or invalid response
+    /// failures.
+    pub fn request_v3(&self, request: Request) -> Result<ServerMessage, ClientError> {
+        self.request_versioned(&ClientRequest::v3(request))
+    }
+
     fn request_versioned(&self, request: &ClientRequest) -> Result<ServerMessage, ClientError> {
         let expected_version = request.version;
         let mut reader = self.start_request(request)?;
@@ -669,6 +748,16 @@ impl ServiceClient {
     /// Returns an error for connection or request-encoding failures.
     pub fn subscribe_v2(&self) -> Result<Subscription, ClientError> {
         self.subscribe_versioned(&ClientRequest::v2(Request::Subscribe))
+    }
+
+    /// Opens a persistent protocol-v3 subscription: the usual first message,
+    /// then the suspended list, then both kinds of update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for connection or request-encoding failures.
+    pub fn subscribe_v3(&self) -> Result<Subscription, ClientError> {
+        self.subscribe_versioned(&ClientRequest::v3(Request::Subscribe))
     }
 
     fn subscribe_versioned(&self, request: &ClientRequest) -> Result<Subscription, ClientError> {
@@ -886,8 +975,9 @@ mod tests {
         minimization::MinimizedWindow,
         protocol::{
             ActionResult, ActionStatus, BubbleAnchor, ClientRequest, ErrorCode, Message, Operation,
-            PROTOCOL_VERSION, PROTOCOL_VERSION_V2, Request, SUPPORTED_PROTOCOL_VERSIONS,
-            ServerMessage, WindowChange, WindowTransition,
+            PROTOCOL_VERSION, PROTOCOL_VERSION_V2, PROTOCOL_VERSION_V3, Request,
+            SUPPORTED_PROTOCOL_VERSIONS, ServerMessage, SuspendedWindow, WindowChange,
+            WindowTransition,
         },
         transition::WindowId,
     };
@@ -930,13 +1020,22 @@ mod tests {
                 Some(*window_id),
                 ActionStatus::CloseRequested,
             ),
-            Request::List | Request::Subscribe => return Err("not an action".to_owned()),
+            Request::Suspend { window_id } => {
+                (Operation::Suspend, *window_id, ActionStatus::Applied)
+            }
+            Request::Resume { window_id } | Request::ToggleSuspend { window_id } => {
+                (Operation::Resume, *window_id, ActionStatus::Applied)
+            }
+            Request::List | Request::Subscribe | Request::ListSuspended => {
+                return Err("not an action".to_owned());
+            }
         };
         Ok(ActionResult {
             operation,
             requested_id,
             window_id: requested_id,
             status,
+            reason: None,
         })
     }
 
@@ -1051,6 +1150,7 @@ mod tests {
                 requested_id: Some(42),
                 window_id: Some(42),
                 status: ActionStatus::CloseRequested,
+                reason: None,
             })
         ));
         assert_eq!(
@@ -1085,6 +1185,7 @@ mod tests {
                 requested_id: Some(42),
                 window_id: Some(42),
                 status: ActionStatus::Applied,
+                reason: None,
             })
         ));
         assert_eq!(calls.lock().expect("lock calls").as_slice(), &[request]);
@@ -1183,7 +1284,7 @@ mod tests {
         serde_json::to_writer(
             &mut stream,
             &ClientRequest {
-                version: 3,
+                version: 9,
                 request: Request::List,
             },
         )
@@ -1200,7 +1301,7 @@ mod tests {
             response.message,
             Message::Error(error)
                 if error.code == ErrorCode::IncompatibleVersion
-                    && error.supported_versions == vec![PROTOCOL_VERSION, 2]
+                    && error.supported_versions == vec![PROTOCOL_VERSION, 2, 3]
         ));
     }
 
@@ -1211,7 +1312,7 @@ mod tests {
         let mut stream = UnixStream::connect(&path).expect("connect");
         stream
             .write_all(
-                b"{\"version\":3,\"request\":{\"type\":\"future_window_portal\",\"opaque\":{\"new\":true}}}\n",
+                b"{\"version\":9,\"request\":{\"type\":\"future_window_portal\",\"opaque\":{\"new\":true}}}\n",
             )
             .expect("send future request");
 
@@ -1271,6 +1372,144 @@ mod tests {
             line.contains("\"revision\":7"),
             "survivor must still receive state, got {line}"
         );
+    }
+
+    fn suspended(id: u64) -> SuspendedWindow {
+        SuspendedWindow {
+            id,
+            app_id: Some("steam_app_1".to_owned()),
+            title: Some("Game".to_owned()),
+        }
+    }
+
+    fn read_timeout(subscription: &mut super::Subscription) -> Option<ServerMessage> {
+        subscription
+            .reader
+            .get_ref()
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .expect("set timeout");
+        subscription.read().ok()
+    }
+
+    #[test]
+    fn suspension_requests_require_v3() {
+        let path = socket();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let service = Service::start(&path, move |request: &Request| {
+            recorded.lock().expect("lock calls").push(request.clone());
+            result(request)
+        })
+        .expect("start service");
+        service.publish_snapshot(&[]).expect("ready service");
+
+        let client = ServiceClient::new(&path);
+        for response in [
+            client.request_v2(Request::ToggleSuspend { window_id: None }),
+            client.request(Request::ListSuspended),
+        ] {
+            assert!(matches!(
+                response.expect("response").message,
+                Message::Error(error)
+                    if error.code == ErrorCode::InvalidRequest
+                        && error.message == "suspension requires Melibea protocol version 3"
+            ));
+        }
+        assert!(calls.lock().expect("lock calls").is_empty());
+
+        let response = client
+            .request_v3(Request::Suspend { window_id: Some(7) })
+            .expect("v3 response");
+        assert_eq!(response.version, PROTOCOL_VERSION_V3);
+        assert!(matches!(
+            response.message,
+            Message::ActionResult(ActionResult {
+                operation: Operation::Suspend,
+                ..
+            })
+        ));
+        assert_eq!(calls.lock().expect("lock calls").len(), 1);
+    }
+
+    #[test]
+    fn v3_subscriber_gets_the_suspended_list_after_the_snapshot() {
+        let path = socket();
+        let service = Service::start(&path, result).expect("start service");
+        service
+            .publish_snapshot(&[window(1, "one")])
+            .expect("publish initial state");
+
+        let client = ServiceClient::new(&path);
+        let mut v3 = client.subscribe_v3().expect("v3 subscription");
+        let mut v1 = client.subscribe().expect("v1 subscription");
+        assert!(matches!(
+            v3.read().expect("snapshot").message,
+            Message::Snapshot { revision: 1, .. }
+        ));
+        assert_eq!(
+            v3.read().expect("empty list"),
+            ServerMessage::for_version(
+                PROTOCOL_VERSION_V3,
+                Message::Suspended {
+                    revision: 0,
+                    windows: Vec::new(),
+                }
+            )
+        );
+        assert!(matches!(
+            v1.read().expect("v1 snapshot").message,
+            Message::Snapshot { .. }
+        ));
+
+        service
+            .publish_suspended(&[suspended(608)])
+            .expect("publish suspended");
+        assert_eq!(
+            v3.read().expect("list").message,
+            Message::Suspended {
+                revision: 1,
+                windows: vec![suspended(608)],
+            }
+        );
+        assert!(read_timeout(&mut v1).is_none(), "v1 must hear nothing");
+
+        let answer = client
+            .request_v3(Request::ListSuspended)
+            .expect("list suspended");
+        assert_eq!(
+            answer.message,
+            Message::Suspended {
+                revision: 1,
+                windows: vec![suspended(608)],
+            }
+        );
+    }
+
+    #[test]
+    fn identical_suspended_list_is_not_rebroadcast() {
+        let path = socket();
+        let service = Service::start(&path, result).expect("start service");
+        service.publish_snapshot(&[]).expect("ready service");
+        let mut v3 = ServiceClient::new(&path)
+            .subscribe_v3()
+            .expect("v3 subscription");
+        v3.read().expect("snapshot");
+        v3.read().expect("empty list");
+
+        service.publish_suspended(&[]).expect("same empty list");
+        assert!(read_timeout(&mut v3).is_none());
+        service.publish_suspended(&[suspended(1)]).expect("first");
+        assert!(matches!(
+            v3.read().expect("first list").message,
+            Message::Suspended { revision: 1, .. }
+        ));
+        service.publish_suspended(&[suspended(1)]).expect("repeat");
+        assert!(read_timeout(&mut v3).is_none());
+        service.publish_suspended(&[]).expect("emptied");
+        assert!(matches!(
+            v3.read().expect("emptied list").message,
+            Message::Suspended { revision: 2, ref windows } if windows.is_empty()
+        ));
     }
 
     #[test]

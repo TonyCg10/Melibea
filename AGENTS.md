@@ -13,7 +13,8 @@ what is planned, where the Niri fork lives).
 
 Read when the trigger applies, before acting on that matter:
 
-- [PROTOCOL.md](PROTOCOL.md) and [PROTOCOL-V2.md](PROTOCOL-V2.md): when a change
+- [PROTOCOL.md](PROTOCOL.md), [PROTOCOL-V2.md](PROTOCOL-V2.md) and
+  [PROTOCOL-V3.md](PROTOCOL-V3.md): when a change
   touches the wire format, `list`/`subscribe`/actions, or what Celestina sends.
 - [PROJECT.md](PROJECT.md): when the request's scope or a product boundary is
   unclear.
