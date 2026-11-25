@@ -45,11 +45,12 @@ const OP_GET_PROPERTY: u8 = 20;
 const OP_QUERY_EXTENSION: u8 = 98;
 const XRES_QUERY_CLIENT_IDS: u8 = 4;
 const XRES_LOCAL_CLIENT_PID: u32 = 2;
+const ERROR_BAD_VALUE: u8 = 2;
 const ERROR_BAD_WINDOW: u8 = 3;
 const GENERIC_EVENT: u8 = 35;
 
 /// Who owns the X11 windows matching an app id and a title.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OwnerLookup {
     /// Exactly one process owns them.
     Owner(u32),
@@ -287,12 +288,16 @@ impl X11Client {
     /// The process owning the root children whose `WM_CLASS` instance or
     /// class equals `app_id` and whose `_NET_WM_NAME` (else `WM_NAME`)
     /// equals `title`. At most [`MAX_X11_WINDOWS`] children are examined.
+    /// An empty `app_id` or `title` matches nothing and sends no request.
     ///
     /// # Errors
     ///
     /// Fails on a protocol error, an X error other than a vanished window,
     /// a closed connection, or when the deadline passes.
     pub fn window_owner(&mut self, app_id: &str, title: &str) -> Result<OwnerLookup, X11Error> {
+        if app_id.is_empty() || title.is_empty() {
+            return Ok(OwnerLookup::NoMatch);
+        }
         if self.closed {
             return Err(protocol("the connection was closed after an earlier error"));
         }
@@ -476,13 +481,18 @@ impl X11Client {
             .is_some_and(|name| latin1(&name) == title))
     }
 
-    /// The host pid of the client owning `window`, from X-Resource.
+    /// The host pid of the client owning `window`, from X-Resource; `None`
+    /// when unknown or the window vanished (`BadWindow` or `BadValue`).
     fn client_pid(&mut self, window: u32) -> Result<Option<u32>, X11Error> {
         let mut body = Vec::new();
         for value in [1, window, XRES_LOCAL_CLIENT_PID] {
             put32(&mut body, value);
         }
-        let reply = self.reply(self.xres_opcode, XRES_QUERY_CLIENT_IDS, &body)?;
+        let reply = match self.request(self.xres_opcode, XRES_QUERY_CLIENT_IDS, &body)? {
+            Answer::Reply(reply) => reply,
+            Answer::Error(ERROR_BAD_WINDOW | ERROR_BAD_VALUE) => return Ok(None),
+            Answer::Error(code) => return Err(x_error(self.xres_opcode, code)),
+        };
         let count = get32(&reply, 8)?;
         let mut at = 32;
         for _ in 0..count {
@@ -743,6 +753,8 @@ mod tests {
         HugeQueryTree,
         ShortQueryTreeBody,
         VanishedWindow(u32),
+        /// The X-Resource request for this window gets this X error.
+        XResError(u32, u8),
     }
 
     struct Fake {
@@ -1095,6 +1107,11 @@ mod tests {
         assert_eq!(get32(request, 4), 1, "one client spec");
         let (client, mask) = (get32(request, 8), get32(request, 12));
         assert_eq!(mask, 2, "LocalClientPID");
+        if let Fault::XResError(window, code) = script.fault
+            && window == client
+        {
+            return error_packet(seq, code);
+        }
         let pid = script
             .windows
             .iter()
@@ -1383,6 +1400,60 @@ mod tests {
             client.window_owner("steam_proton", "Victoria 3").unwrap(),
             OwnerLookup::Owner(90_994)
         );
+        drop(client);
+        fake.finish();
+    }
+
+    #[test]
+    fn a_window_that_vanishes_before_xres_is_skipped() {
+        let twin = window(
+            0x0280_0009,
+            ("steam_proton", "steam_proton"),
+            "Victoria 3",
+            91_006,
+        );
+        for (name, code) in [("bad-window", 3), ("bad-value", 2)] {
+            let mut windows = victoria_windows();
+            windows.push(twin);
+            let mut s = script(windows);
+            s.fault = Fault::XResError(0x0280_0009, code);
+            let fake = spawn(&format!("xres-{name}"), s);
+            let mut client = connect(&fake);
+            assert_eq!(
+                client.window_owner("steam_proton", "Victoria 3").unwrap(),
+                OwnerLookup::Owner(90_994),
+                "{name}"
+            );
+            drop(client);
+            fake.finish();
+        }
+        // Any other X error still fails the lookup.
+        let mut windows = victoria_windows();
+        windows.push(twin);
+        let mut s = script(windows);
+        s.fault = Fault::XResError(0x0280_0009, 1);
+        let fake = spawn("xres-bad-request", s);
+        let mut client = connect(&fake);
+        let result = client.window_owner("steam_proton", "Victoria 3");
+        assert!(matches!(result, Err(X11Error::Protocol(_))), "{result:?}");
+        drop(client);
+        fake.finish();
+    }
+
+    #[test]
+    fn an_empty_app_id_or_title_sends_no_request() {
+        let fake = spawn("empty", script(victoria_windows()));
+        let mut client = connect(&fake);
+        let sequence = client.sequence;
+        assert_eq!(
+            client.window_owner("", "Victoria 3").unwrap(),
+            OwnerLookup::NoMatch
+        );
+        assert_eq!(
+            client.window_owner("steam_proton", "").unwrap(),
+            OwnerLookup::NoMatch
+        );
+        assert_eq!(client.sequence, sequence);
         drop(client);
         fake.finish();
     }
