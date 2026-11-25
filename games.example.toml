@@ -1,0 +1,16 @@
+# Copy to $XDG_CONFIG_HOME/melibea/games.toml (or ~/.config/melibea/games.toml).
+# Rules are resolved top to bottom; the first match wins. A window whose app id
+# is `steam_app_<N>` is a game even without a rule.
+
+# A Wine game found by the name of its executable.
+[[game]]
+app_id = "^steam_proton$"     # regex, optional
+title = "^Victoria 3$"        # regex, optional; at least one of the two
+process = "victoria3.exe"     # this, or steam_app_id, or neither
+standby_after = "5m"          # optional: suspend after staying minimized this long
+
+# A native Steam game: its window is not steam_app_<N>, so the rule names the id.
+[[game]]
+app_id = "^dotnet$"
+title = "^Terraria"
+steam_app_id = 1281930
