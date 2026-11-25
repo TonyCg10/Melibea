@@ -298,7 +298,7 @@ pub fn steam_app_id(app_id: &str) -> Option<u64>;            // "steam_app_<deci
 pub fn parse_delay(text: &str) -> Result<Duration, String>;  // "<u64>s" | "<u64>m" | "<u64>h"
 pub fn game_set(table: &ProcessTable, identity: &GameIdentity) -> BTreeSet<u32>; // matches + descendants
 ```
-Raw rule: `[[game]]` with `app_id`, `title` (regex, at least one), `process` (non-empty, no `/` or `\`), `standby_after`; unknown fields rejected. A matching rule with `process` gives `Process`; without it, `SteamApp` when the app id is `steam_app_<N>`, else `None`. With no matching rule, `steam_app_<N>` gives `SteamApp` with no delay.
+Raw rule: `[[game]]` with `app_id`, `title` (regex, at least one), `process` (non-empty, no `/` or `\`), `steam_app_id` (u64 > 0; at most one of `process` and `steam_app_id`), `standby_after`; unknown fields rejected. A matching rule with `process` gives `Process`; with `steam_app_id` gives `SteamApp` with that id; with neither, `SteamApp` when the app id is `steam_app_<N>`, else `None`. With no matching rule, `steam_app_<N>` gives `SteamApp` with no delay.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -306,8 +306,9 @@ Raw rule: `[[game]]` with `app_id`, `title` (regex, at least one), `process` (no
 - `the_first_matching_rule_wins`: two rules matching title `^Victoria 3$` with processes `a.exe`, `b.exe` → `Process { name: "a.exe" }`.
 - `a_rule_names_the_process_case_insensitively`: rule `process = "Victoria3.EXE"` → name `victoria3.exe`; `game_set` finds a process with `argv0` `Z:\x\VICTORIA3.exe` and its child, and not `start.exe` whose arguments mention `victoria3.exe`.
 - `a_rule_without_process_needs_a_steam_window`: rule `title = "^X$"` matches window `steam_app_5`/`X` → `SteamApp { 5 }` with the rule's delay; window `foo`/`X` → `None`.
+- `a_rule_names_a_native_steam_game`: rule `app_id = "^dotnet$"`, `steam_app_id = 1281930` on window `dotnet`/`Terraria: ¡Cava y calla!` → `SteamApp { 1281930 }`.
 - `steam_game_set_follows_the_environment`: processes with `steam_app_id == Some(5)` and their descendants, not the Steam client.
-- `rules_are_validated`: no matcher, invalid regex, empty `process`, `process = "a/b"`, `standby_after = "5x"`, unknown field → errors naming the rule number (`rule 2: …`).
+- `rules_are_validated`: no matcher, invalid regex, empty `process`, `process = "a/b"`, both `process` and `steam_app_id`, `steam_app_id = 0`, `standby_after = "5x"`, unknown field → errors naming the rule number (`rule 2: …`).
 - `delays_parse`: `"0s"` → 0, `"90s"` → 90 s, `"5m"` → 300 s, `"1h"` → 3600 s; `"5"`, `"m"`, `"-1s"` → errors.
 - `a_missing_file_means_no_rules`.
 
@@ -569,7 +570,7 @@ Fakes in the test module:
 
 The base fixture is the spec's session: Bottles scope with `bwrap`, `bottles`, `wineserver`, `victoria3.exe` (pid 4242); Steam client scope; satellite in `niri.service`; window 608 `steam_proton`/`Victoria 3` with the satellite's pid; rule `title = "^Victoria 3$"`, `process = "victoria3.exe"`.
 - `suspend_moves_only_the_bottles_game_then_flags_then_freezes`: calls are exactly `start_scope("app-melibea-game-4242.scope", {4242})`, `set_suspended(608, true)`, `freeze("app-melibea-game-4242.scope")`; `wineserver` and `bottles` stay in the Flatpak unit; the ledger holds one entry with windows `[608]`.
-- `suspend_moves_a_steam_game_by_app_id`: reaper (`SteamAppId=5`) and its child moved together; the Steam client is not.
+- `suspend_moves_a_steam_game_by_app_id`: as the spike found for tModLoader, processes with `SteamAppId=5` sit in three Steam units (`steam-runtime-launch-client` in the client's, `reaper` in the launcher's, the game in its container's); all of them and their descendants move into one game scope, and the Steam client, `bwrap` and `xdg-dbus-proxy` do not.
 - `refuses_a_window_that_is_not_a_game`: focused Floorp → `Blocked(NotAGame)`, no systemd or compositor call, ledger untouched.
 - `refuses_a_game_set_with_a_protected_process`: the rule's process runs in `niri.service` → `Blocked(ProtectedProcess)`, no calls.
 - `refuses_a_game_that_is_not_running`.
@@ -758,6 +759,7 @@ With the author's request:
 
 In the real session:
 - Victoria 3 toggled twice: frozen with no CPU, blurred, then resumed intact. Bottles stays usable while it is frozen.
+- While Victoria 3 is suspended, the author clicks on it repeatedly; after resuming, none of those clicks has acted in the game. The spike found that without the fork's input exclusion they were queued by Xwayland and replayed on thaw.
 - A Steam game toggled the same way, with the Steam client usable meanwhile.
 - The bind pressed on Floorp does nothing and prints the reason in `journalctl --user -t niri`.
 - `systemctl --user restart melibea.service` while a game is frozen thaws it.

@@ -276,6 +276,33 @@ awaiting its real-session check meanwhile.
 **Estimated effort:** not estimated; the spike comes first, as M3 came before
 M4, and sizes the rest.
 
+### Spike
+
+Passed on 2026-11-25, by hand with `busctl --user call … StartTransientUnit`
+and `systemctl --user freeze|thaw`, on systemd 262 with cgroup v2:
+
+- **Synthetic.** A `yes` process moved out of a service into
+  `app-melibea-game-<pid>.scope`; freezing took 4 ms; its CPU ticks stayed at
+  128 for 3 s and rose to 225 a second after the thaw.
+- **Bottles, Victoria 3.** The game process (`argv[0]` `…\victoria3.exe`, `comm`
+  `Main Thread`) moved alone out of the Bottles Flatpak unit, whose other 16
+  processes, including `wineserver`, stayed. Frozen ten minutes: CPU usage of
+  its scope unchanged (56.7 ms before and after), Bottles usable throughout,
+  no warning in the user journal, the game alive and running after the thaw.
+  **Finding:** the author's clicks on the frozen window were queued through
+  xwayland-satellite and Xwayland and acted in the game after the thaw. The
+  fork's input exclusion (plan task 3) is what protects the game's state, and
+  the real-session check now tests it.
+- **Steam, tModLoader (app 1281930), a native game under Xwayland.** Its window
+  is app id `dotnet`, not `steam_app_1281930`: Steam names windows only for
+  Proton games, so `[[game]]` rules gained `steam_app_id`. The five processes
+  carrying `SteamAppId=1281930` sat in three Steam units (client, launcher and
+  the game's container); they and one descendant moved into one game scope.
+  Frozen two minutes: CPU unchanged, the Steam client usable, the game intact
+  after the thaw, and Steam registered its exit.
+
+The gate passed: moving a game's processes out of a Flatpak unit works.
+
 ### Outcome
 
 A bind toggles the focused game like a console suspends one: Melibea moves the

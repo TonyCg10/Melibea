@@ -72,8 +72,13 @@ A window is a game when, checked in this order:
 [[game]]
 app_id = "^steam_proton$"     # regex, optional
 title = "^Victoria 3$"        # regex, optional; at least one of the two
-process = "victoria3.exe"     # optional, see below
+process = "victoria3.exe"     # this, or steam_app_id, or neither (see below)
 standby_after = "5m"          # optional: suspend after staying minimized this long
+
+[[game]]                      # a native Steam game: its window is not steam_app_<N>
+app_id = "^dotnet$"
+title = "^Terraria"
+steam_app_id = 1281930
 ```
 
 A game's processes are found from one `/proc` snapshot of the user's
@@ -84,9 +89,11 @@ processes:
   sets `argv[0]` to the Windows path and `comm` to a thread name, so `comm` is
   not used.
 - **By Steam app id** otherwise: every process whose environment holds
-  `SteamAppId=<N>`, where `N` comes from the window's `steam_app_<N>` app id. A
-  rule without `process` on a window that is not `steam_app_<N>` recognizes
-  nothing.
+  `SteamAppId=<N>`, where `N` is the rule's `steam_app_id` or comes from the
+  window's `steam_app_<N>` app id. Steam names the window `steam_app_<N>` only
+  for Proton games; a native game keeps its own app id (tModLoader's is
+  `dotnet`), so its rule names the id. A rule naming neither on a window that
+  is not `steam_app_<N>` recognizes nothing; a rule naming both is invalid.
 
 The **game set** is those processes and all their descendants. The
 **game's windows** are every window recognized as the same game (same rule and
