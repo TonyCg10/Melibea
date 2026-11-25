@@ -85,22 +85,25 @@ Resuming thaws the scope first and clears the niri flag afterwards. See the
 [design](docs/superpowers/specs/2026-11-17-melibea-standby-design.md) and
 [PROTOCOL-V3.md](PROTOCOL-V3.md).
 
-A window whose app id is `steam_app_<N>` is a game without any configuration.
-Other games are named in `~/.config/melibea/games.toml`, or
-`$XDG_CONFIG_HOME/melibea/games.toml` when `XDG_CONFIG_HOME` is set. Rules are
-resolved from top to bottom and the first match wins:
+Most games need no rule. A window is a game when its app id is `steam_app_<N>`,
+or when the process that owns it has `SteamAppId=<N>` in its environment (any
+Steam game, native or Proton) or `WINESERVERSOCKET` (Wine, Proton, Bottles,
+Lutris, Heroic). For a native Wayland window that process is niri's pid; for an
+X11 window niri reports `xwayland-satellite`, so Melibea asks the X server
+(X-Resource) which process owns the window, and recognizes it only when exactly
+one does. `WINEPREFIX` alone never marks a game.
+
+Rules remain for native non-Steam games and for `standby_after`. They are in
+`~/.config/melibea/games.toml`, or `$XDG_CONFIG_HOME/melibea/games.toml` when
+`XDG_CONFIG_HOME` is set, resolved from top to bottom with the first match
+winning, and they take precedence over detection:
 
 ```toml
-[[game]]
-app_id = "^steam_proton$"     # regex, optional
-title = "^Victoria 3$"        # regex, optional; at least one of the two
-process = "victoria3.exe"     # this, or steam_app_id, or neither
+[[game]]                      # a native non-Steam game found by its executable
+app_id = "^mygame$"           # regex, optional
+title = "^My Game$"           # regex, optional; at least one of the two
+process = "mygame"            # this, or steam_app_id, or neither
 standby_after = "5m"          # optional: suspend after staying minimized this long
-
-[[game]]                      # a native Steam game: its window is not steam_app_<N>
-app_id = "^dotnet$"
-title = "^Terraria"
-steam_app_id = 1281930
 ```
 
 Name `app_id` in every rule and anchor `title` with `^`: a rule with only a

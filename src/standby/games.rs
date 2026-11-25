@@ -360,6 +360,7 @@ mod tests {
             argv0: argv0.map(str::to_string),
             cgroup: String::new(),
             steam_app_id: steam,
+            is_wine: false,
         }
     }
 
@@ -523,8 +524,14 @@ mod tests {
             }
         );
         assert_eq!(victoria.standby_after, Some(Duration::from_secs(300)));
-        let tml = r.recognize(Some("dotnet"), Some("Terraria")).unwrap();
-        assert_eq!(tml.identity, steam(1_281_930));
+        let native = r.recognize(Some("mygame"), Some("My Game")).unwrap();
+        assert_eq!(
+            native.identity,
+            GameIdentity::Process {
+                name: "mygame".into()
+            }
+        );
+        assert_eq!(native.standby_after, None);
     }
 
     #[test]

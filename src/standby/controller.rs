@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::games::{GameIdentity, GameRules, game_set};
+use super::detect::{WindowOwners, detect};
+use super::games::{GameIdentity, GameRules, RecognizedGame, game_set};
 use super::ledger::{Ledger, LedgerEntry};
 use super::process::{ProcessInfo, ProcessTable, app_unit};
 use super::systemd::{FreezerState, Systemd, game_unit_name, is_game_unit};
@@ -162,9 +163,16 @@ pub enum StandbyOperation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockReason {
     NotAGame,
+    /// Several processes own windows named like the target (X11).
+    AmbiguousOwner(String),
     GameNotRunning,
-    ProtectedProcess { pid: u32, comm: String },
-    GameEscaped { pids: Vec<u32> },
+    ProtectedProcess {
+        pid: u32,
+        comm: String,
+    },
+    GameEscaped {
+        pids: Vec<u32>,
+    },
     InvalidRules(String),
     Systemd(String),
     Ledger(String),
@@ -176,7 +184,7 @@ impl BlockReason {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
-            Self::NotAGame => "not_a_game",
+            Self::NotAGame | Self::AmbiguousOwner(_) => "not_a_game",
             Self::GameNotRunning => "game_not_running",
             Self::ProtectedProcess { .. } => "protected_process",
             Self::GameEscaped { .. } => "game_escaped",
@@ -192,6 +200,9 @@ impl BlockReason {
     pub fn describe(&self) -> String {
         match self {
             Self::NotAGame => "the window is not a recognized game".into(),
+            Self::AmbiguousOwner(text) => {
+                format!("the window is not a recognized game: {text}")
+            }
             Self::GameNotRunning => "no process of the game is running".into(),
             Self::ProtectedProcess { pid, comm } => {
                 format!("process {pid} ({comm}) must not be frozen")
@@ -323,6 +334,8 @@ pub struct Standby<S: Systemd, P: ProcessSource> {
     uid: u32,
     /// How long `thaw_confirmed` polls a transient freezer state.
     thaw_timeout: Duration,
+    /// Answers which process owns an X11 window.
+    owners: Box<dyn WindowOwners + Send>,
 }
 
 impl<S: Systemd, P: ProcessSource> Standby<S, P> {
@@ -334,6 +347,7 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
         games_path: PathBuf,
         own_pid: u32,
         uid: u32,
+        owners: Box<dyn WindowOwners + Send>,
     ) -> Self {
         Self {
             systemd,
@@ -343,6 +357,7 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
             own_pid,
             uid,
             thaw_timeout: THAW_CONFIRM_TIMEOUT,
+            owners,
         }
     }
 
@@ -551,6 +566,25 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
         Ok(units.into_iter().collect())
     }
 
+    /// Step 2: a rule or `steam_app_<N>` first, else the owner's environment
+    /// read from `table`.
+    fn recognize(
+        rules: &GameRules,
+        owners: &mut dyn WindowOwners,
+        table: &ProcessTable,
+        window: &WindowView,
+    ) -> Result<Option<RecognizedGame>, String> {
+        if let Some(game) = rules.recognize(window.app_id.as_deref(), window.title.as_deref()) {
+            return Ok(Some(game));
+        }
+        Ok(
+            detect(window, table, owners)?.map(|identity| RecognizedGame {
+                identity,
+                standby_after: None,
+            }),
+        )
+    }
+
     // ---- suspend ---------------------------------------------------------
 
     fn try_suspend(
@@ -585,8 +619,10 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
         // Step 2: recognize.
         let rules = GameRules::load(&self.games_path)
             .map_err(|error| block(BlockReason::InvalidRules(error.to_string())))?;
-        let game = rules
-            .recognize(target.app_id.as_deref(), target.title.as_deref())
+        // Detection needs the process table, so one snapshot precedes discovery.
+        let detection_table = self.snapshot().map_err(block)?;
+        let game = Self::recognize(&rules, self.owners.as_mut(), &detection_table, &target)
+            .map_err(|text| block(BlockReason::AmbiguousOwner(text)))?
             .ok_or_else(|| block(BlockReason::NotAGame))?;
         // Steps 3–5: discover, check, separate, check the units.
         let (table, set) = self.separate(&game.identity).map_err(block)?;
@@ -594,23 +630,24 @@ impl<S: Systemd, P: ProcessSource> Standby<S, P> {
         // Step 6: the game's windows. A window recognized by a rule counts
         // only with the target's app id: a title-only rule also matches a
         // browser tab named after the game.
-        let game_windows: Vec<u64> = windows
-            .iter()
-            .filter(|window| {
-                let same_game = window.app_id == target.app_id
-                    && rules
-                        .recognize(window.app_id.as_deref(), window.title.as_deref())
-                        .is_some_and(|other| other.identity == game.identity);
-                let in_set = window
-                    .pid
-                    .and_then(|pid| u32::try_from(pid).ok())
-                    .is_some_and(|pid| set.contains(&pid));
-                same_game || in_set
-            })
-            .map(|window| window.id)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let mut game_windows: BTreeSet<u64> = BTreeSet::new();
+        for window in &windows {
+            let in_set = window
+                .pid
+                .and_then(|pid| u32::try_from(pid).ok())
+                .is_some_and(|pid| set.contains(&pid));
+            let same_game = in_set
+                || window.id == id
+                || (window.app_id == target.app_id
+                    && Self::recognize(&rules, self.owners.as_mut(), &table, window)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|other| other.identity == game.identity));
+            if same_game {
+                game_windows.insert(window.id);
+            }
+        }
+        let game_windows: Vec<u64> = game_windows.into_iter().collect();
         // Step 7: record before changing anything visible or frozen.
         let mut recorded = entries.clone();
         recorded.push(LedgerEntry {
@@ -933,12 +970,15 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::standby::detect::WindowOwners;
     use crate::standby::games::GameIdentity;
     use crate::standby::ledger::{Ledger, LedgerEntry};
     use crate::standby::process::{ProcessInfo, ProcessTable};
     use crate::standby::systemd::{FreezerState, Systemd, SystemdError};
+    use crate::standby::x11::OwnerLookup;
 
     const UID: u32 = 1000;
     const OWN_PID: u32 = 9999;
@@ -973,11 +1013,34 @@ mod tests {
         reports: Vec<FreezerState>,
     }
 
+    /// What the fake X server answers, shared with the fixture.
+    #[derive(Default)]
+    struct XServer {
+        /// `None` means no lookup is possible, else the owner pids of the matching windows.
+        owners: Option<Vec<u32>>,
+        /// `(app_id, title)` of every lookup made.
+        calls: Vec<(String, String)>,
+    }
+
     type Shared = Rc<RefCell<World>>;
 
     struct FakeSystemd(Shared);
     struct FakeProcesses(Shared);
     struct FakeCompositor(Shared);
+    struct FakeOwners(Arc<Mutex<XServer>>);
+
+    impl WindowOwners for FakeOwners {
+        fn owner(&mut self, app_id: &str, title: &str) -> Option<OwnerLookup> {
+            let mut server = self.0.lock().unwrap();
+            server.calls.push((app_id.into(), title.into()));
+            let pids = server.owners.clone()?;
+            Some(match pids.as_slice() {
+                [] => OwnerLookup::NoMatch,
+                [pid] => OwnerLookup::Owner(*pid),
+                _ => OwnerLookup::Ambiguous(pids),
+            })
+        }
+    }
 
     fn failed(text: &str) -> SystemdError {
         SystemdError::Failed {
@@ -1119,6 +1182,7 @@ mod tests {
             argv0: argv0.map(Into::into),
             cgroup: cgroup.into(),
             steam_app_id: None,
+            is_wine: false,
         }
     }
 
@@ -1211,11 +1275,21 @@ mod tests {
     struct Fixture {
         dir: PathBuf,
         world: Shared,
+        xserver: Arc<Mutex<XServer>>,
         standby: Standby<FakeSystemd, FakeProcesses>,
     }
 
     impl Fixture {
         fn new(name: &str, rules: Option<&str>, world: World) -> Self {
+            Self::with_owners(name, rules, world, None)
+        }
+
+        fn with_owners(
+            name: &str,
+            rules: Option<&str>,
+            world: World,
+            owners: Option<Vec<u32>>,
+        ) -> Self {
             let dir = std::env::temp_dir()
                 .join(format!("melibea-controller-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
@@ -1224,6 +1298,10 @@ mod tests {
                 fs::write(dir.join("games.toml"), rules).unwrap();
             }
             let world = Rc::new(RefCell::new(world));
+            let xserver = Arc::new(Mutex::new(XServer {
+                owners,
+                calls: Vec::new(),
+            }));
             let standby = Standby::new(
                 FakeSystemd(world.clone()),
                 FakeProcesses(world.clone()),
@@ -1231,10 +1309,12 @@ mod tests {
                 dir.join("games.toml"),
                 OWN_PID,
                 UID,
+                Box::new(FakeOwners(xserver.clone())),
             );
             Self {
                 dir,
                 world,
+                xserver,
                 standby,
             }
         }
@@ -1257,6 +1337,10 @@ mod tests {
                 .into_iter()
                 .filter(|call| !call.starts_with("freezer_state") && call != "game_units")
                 .collect()
+        }
+
+        fn owner_calls(&self) -> Vec<(String, String)> {
+            self.xserver.lock().unwrap().calls.clone()
         }
 
         fn clear_calls(&self) {
@@ -1380,6 +1464,130 @@ mod tests {
             f.entries()[0].identity,
             GameIdentity::SteamApp { app_id: 5 }
         );
+    }
+
+    /// Victoria's Wine process as the environment marks it.
+    fn make_wine(world: &mut World, pid: u32) {
+        world.processes.get_mut(&pid).unwrap().is_wine = true;
+    }
+
+    fn assert_victoria_suspended(f: &Fixture, outcome: &StandbyOutcome) {
+        assert_eq!(
+            *outcome,
+            StandbyOutcome::Applied {
+                operation: StandbyOperation::Suspend,
+                window_id: 608,
+                windows: vec![608],
+            }
+        );
+        assert_eq!(f.state(GAME_UNIT), Some(FreezerState::Frozen));
+        assert_eq!(f.cgroup(4242), in_app(GAME_UNIT));
+        assert_eq!(f.cgroup(4200), in_app(BOTTLES));
+        assert_eq!(f.suspended_windows(), vec![608]);
+    }
+
+    #[test]
+    fn suspend_detects_victoria_3_without_rules() {
+        let mut world = victoria_world();
+        make_wine(&mut world, 4242);
+        let mut f = Fixture::with_owners("detect-victoria", None, world, Some(vec![4242]));
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        assert_victoria_suspended(&f, &outcome);
+        assert_eq!(
+            f.owner_calls(),
+            vec![("steam_proton".to_owned(), "Victoria 3".to_owned())]
+        );
+        assert_eq!(
+            f.entries()[0].identity,
+            GameIdentity::Process {
+                name: "victoria3.exe".into()
+            }
+        );
+    }
+
+    #[test]
+    fn suspend_detects_a_native_steam_game_by_pid() {
+        let mut world = steam_world();
+        world.windows = vec![window(800, "dotnet", "Terraria", 3400, true)];
+        world.processes.get_mut(&3400).unwrap().steam_app_id = Some(1_281_930);
+        let mut f = Fixture::with_owners("detect-native", None, world, Some(vec![1]));
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        assert!(
+            matches!(outcome, StandbyOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            f.entries()[0].identity,
+            GameIdentity::SteamApp { app_id: 1_281_930 }
+        );
+        assert!(f.owner_calls().is_empty());
+    }
+
+    #[test]
+    fn without_x11_a_satellite_window_is_not_a_game() {
+        let mut world = victoria_world();
+        make_wine(&mut world, 4242);
+        let mut f = Fixture::with_owners("detect-no-x11", None, world, None);
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        assert_eq!(blocked_code(&outcome), "not_a_game");
+        assert!(f.changes().is_empty());
+        assert_eq!(f.owner_calls().len(), 1);
+    }
+
+    #[test]
+    fn an_ambiguous_x11_owner_is_refused() {
+        let mut world = victoria_world();
+        make_wine(&mut world, 4242);
+        let mut f = Fixture::with_owners("detect-ambiguous", None, world, Some(vec![4242, 4243]));
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        assert_eq!(blocked_code(&outcome), "not_a_game");
+        let StandbyOutcome::Blocked { reason, .. } = outcome else {
+            panic!("expected a block");
+        };
+        assert!(
+            reason.describe().contains("2 processes"),
+            "{}",
+            reason.describe()
+        );
+        assert!(f.changes().is_empty());
+    }
+
+    #[test]
+    fn a_second_detected_window_of_the_same_game_is_flagged_too() {
+        let mut world = victoria_world();
+        make_wine(&mut world, 4242);
+        world.windows[1] = window(609, "steam_proton", "Victoria 3 launcher", 2000, false);
+        let mut f = Fixture::with_owners("detect-siblings", None, world, Some(vec![4242]));
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, Some(608));
+        assert!(
+            matches!(outcome, StandbyOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(f.suspended_windows(), vec![608, 609]);
+        // One lookup for the target, one for the other window with its app id.
+        assert_eq!(f.owner_calls().len(), 2);
+    }
+
+    #[test]
+    fn a_rule_still_wins_over_detection() {
+        let mut world = victoria_world();
+        // Detection would name another game; the rule decides.
+        make_wine(&mut world, 4200);
+        let mut f = Fixture::with_owners(
+            "detect-rule-wins",
+            Some(VICTORIA_RULES),
+            world,
+            Some(vec![4200]),
+        );
+        let mut niri = f.niri();
+        let outcome = f.standby.suspend(&mut niri, None);
+        assert_victoria_suspended(&f, &outcome);
+        assert!(f.owner_calls().is_empty());
     }
 
     #[test]
@@ -2180,6 +2388,7 @@ mod tests {
     fn block_reasons_have_stable_codes() {
         let reasons = [
             (BlockReason::NotAGame, "not_a_game"),
+            (BlockReason::AmbiguousOwner("x".into()), "not_a_game"),
             (BlockReason::GameNotRunning, "game_not_running"),
             (
                 BlockReason::ProtectedProcess {

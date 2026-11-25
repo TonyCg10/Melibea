@@ -23,6 +23,8 @@ pub struct ProcessInfo {
     pub cgroup: String,
     /// `SteamAppId` from the environment, when readable and numeric.
     pub steam_app_id: Option<u64>,
+    /// The environment holds `WINESERVERSOCKET`, which Wine sets for its processes.
+    pub is_wine: bool,
 }
 
 /// A snapshot of processes indexed by pid.
@@ -134,12 +136,14 @@ fn read_process(dir: &Path, pid: u32) -> Option<ProcessInfo> {
         .find_map(|line| line.strip_prefix("0::"))
         .unwrap_or_default()
         .to_string();
-    let steam_app_id = fs::read(dir.join("environ")).ok().and_then(|bytes| {
-        bytes.split(|b| *b == 0).find_map(|var| {
-            let value = var.strip_prefix(b"SteamAppId=")?;
-            std::str::from_utf8(value).ok()?.parse::<u64>().ok()
-        })
+    let environ = fs::read(dir.join("environ")).unwrap_or_default();
+    let steam_app_id = environ.split(|b| *b == 0).find_map(|var| {
+        let value = var.strip_prefix(b"SteamAppId=")?;
+        std::str::from_utf8(value).ok()?.parse::<u64>().ok()
     });
+    let is_wine = environ
+        .split(|b| *b == 0)
+        .any(|var| var.starts_with(b"WINESERVERSOCKET="));
     Some(ProcessInfo {
         pid,
         ppid: parent,
@@ -148,6 +152,7 @@ fn read_process(dir: &Path, pid: u32) -> Option<ProcessInfo> {
         argv0,
         cgroup,
         steam_app_id,
+        is_wine,
     })
 }
 
@@ -222,6 +227,7 @@ mod tests {
             argv0: None,
             cgroup: String::new(),
             steam_app_id: None,
+            is_wine: false,
         }
     }
 
@@ -255,6 +261,32 @@ mod tests {
         let table = ProcessTable::read(&root).unwrap();
         assert_eq!(table.get(7).unwrap().steam_app_id, Some(1_158_310));
         assert_eq!(table.get(8).unwrap().steam_app_id, None);
+    }
+
+    #[test]
+    fn a_wine_process_is_recognized_by_its_server_socket() {
+        let root = fixture("winesocket");
+        write_pid(
+            &root,
+            11,
+            Some("11 (Main Thread) S 1 11 11 0"),
+            b"WINEPREFIX=/home/x/prefix\0WINESERVERSOCKET=/run/wine\0",
+        );
+        let table = ProcessTable::read(&root).unwrap();
+        assert!(table.get(11).unwrap().is_wine);
+    }
+
+    #[test]
+    fn wineprefix_alone_is_not_wine() {
+        let root = fixture("wineprefix");
+        write_pid(
+            &root,
+            12,
+            Some("12 (floorp) S 1 12 12 0"),
+            b"WINEPREFIX=/home/x/prefix\0",
+        );
+        let table = ProcessTable::read(&root).unwrap();
+        assert!(!table.get(12).unwrap().is_wine);
     }
 
     #[test]

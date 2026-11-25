@@ -1,6 +1,7 @@
 //! Standby for games: finding a game's processes and units.
 
 pub mod controller;
+pub mod detect;
 pub mod games;
 pub mod ledger;
 pub mod process;

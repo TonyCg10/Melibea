@@ -29,6 +29,7 @@ use melibea::{
     service::{ActionExecutor, Service, ServiceClient, socket_path},
     standby::{
         controller::{LiveCompositor, ProcFs, Standby, StandbyOutcome, outcome_result},
+        detect::LiveX11,
         games::{GameRules, default_games_path},
         ledger::{Ledger, LedgerEntry},
         systemd::SystemdTools,
@@ -645,6 +646,7 @@ fn thaw_all() -> ExitCode {
         PathBuf::from("/nonexistent/melibea-thaw-all-reads-no-rules"),
         std::process::id(),
         uid,
+        Box::new(LiveX11),
     );
     let lines = match NiriActionClient::connect() {
         Ok(client) => standby.thaw_all(Some(&mut LiveCompositor::new(client))),
@@ -675,6 +677,7 @@ fn live_standby() -> Result<(LiveStandby, PathBuf), String> {
         games_path.clone(),
         std::process::id(),
         uid,
+        Box::new(LiveX11),
     );
     Ok((standby, games_path))
 }
